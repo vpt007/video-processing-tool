@@ -1,0 +1,33 @@
+Video preview options
+	- using ffmpeg
+	   Cons:
+		- build playback logic yourself
+		- harder audio/video sync
+		- harder realtime preview
+		- difficult seekin
+		- focus will shift from making editor to player.
+		So for preview we end up building:
+			- scheduler
+			- clock
+			- sync system
+			- buffering
+			- playback state machine
+			- seek management
+	   pros:
+	   	- complete control over video pipeline
+			- only good when we need full fledge video editor.
+	- using gstremer.
+		Pros:
+
+			- easier playback pipeline
+			- realtime oriented
+			- built-in seeking/sync
+			- hardware decode easier
+			- plugin architecture
+			- good for preview engine
+			- cross-platform
+		Cons:
+			- Heavy reliance on dynamically discovered plugins
+			- Difficult to statically link into a single binary
+			- Shared libraries/DLLs must be distributed separately
+			- Plugin registry system expects runtime-discoverable modules
