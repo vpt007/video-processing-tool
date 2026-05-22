@@ -1,0 +1,16 @@
+nob.h(Header only library for writing build recipes in C) 
+https://github.com/tsoding/nob.h
+
+DearImGui(Bloat-free Graphical User interface for C++ with minimal dependencies)
+https://github.com/ocornut/imgui
+https://github.com/ocornut/imgui/archive/refs/tags/v1.92.8.zip
+
+Cimgui(ImGui binding for C)
+https://github.com/cimgui/cimgui
+
+ffmpeg(A complete, cross-platform solution to record, convert and stream audio and video.)
+https://ffmpeg.org/
+
+
+GLFW(GLFW is an Open Source, multi-platform library for OpenGL, OpenGL ES and Vulkan development on the desktop. It provides a simple API for creating windows, contexts and surfaces, receiving input and events.)
+https://www.glfw.org/
