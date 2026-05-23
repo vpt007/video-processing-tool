@@ -14,3 +14,6 @@ https://ffmpeg.org/
 
 GLFW(GLFW is an Open Source, multi-platform library for OpenGL, OpenGL ES and Vulkan development on the desktop. It provides a simple API for creating windows, contexts and surfaces, receiving input and events.)
 https://www.glfw.org/
+
+subporcess.h(Subprocess is a single header cross-platform library that allows users to launch sub-processes, interact with the stdin, stdout, and stderr of the process, and wait for them to complete)
+https://github.com/sheredom/subprocess.h
