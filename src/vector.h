@@ -1,4 +1,6 @@
-#include <stdio.h>
+#ifndef VECTOR_H
+#define VECTOR_H
+#include <stdlib.h>
 
 #define vpopulate(t) t* items; size_t count; size_t capacity
 
@@ -20,3 +22,4 @@
 #define vat(arr, i) ((arr).items[i])
 #define vpop(arr)   ((arr).items[--(arr).count])
 #define vclear(arr) ((arr).count = 0)
+#endif
