@@ -17,3 +17,9 @@ https://www.glfw.org/
 
 subporcess.h(Subprocess is a single header cross-platform library that allows users to launch sub-processes, interact with the stdin, stdout, and stderr of the process, and wait for them to complete)
 https://github.com/sheredom/subprocess.h
+
+https://gen.glad.sh/
+
+
+cJSON(Ultralightweight JSON parser in ANSI C )
+https://github.com/DaveGamble/cJSON
