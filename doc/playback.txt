@@ -1,4 +1,4 @@
-Video preview options
+Video preview options 
 	- using ffmpeg
 	   Cons:
 		- build playback logic yourself
