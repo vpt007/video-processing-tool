@@ -1414,6 +1414,7 @@ int main(int argc, char *argv[])
 		glfwTerminate();
 		return -1;
 	}
+	glfwSetWindowAspectRatio(window, 16, 9);
 	glfwMakeContextCurrent(window);
 	gladLoadGL(glfwGetProcAddress);
 	// enable vsync
