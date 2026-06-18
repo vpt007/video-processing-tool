@@ -23,3 +23,6 @@ https://gen.glad.sh/
 
 cJSON(Ultralightweight JSON parser in ANSI C )
 https://github.com/DaveGamble/cJSON
+
+Miniaudio(Audio)
+https://raw.githubusercontent.com/mackron/miniaudio/refs/heads/master/miniaudio.h
