@@ -140,6 +140,11 @@ void vp_engine_set_vf(VPEngine* e, const char* vf);  /* NULL/"" = passthrough */
 void vp_engine_set_af(VPEngine* e, const char* af);
 void vp_engine_set_scale(VPEngine* e, float scale);
 
+/* Re-render the current frame through the (possibly just-changed) filter graph.
+   Useful while paused, where no new frames flow so a vf/af change wouldn't show
+   until playback resumes. Safe to call any time. */
+void vp_engine_refresh(VPEngine* e);
+
 void vp_engine_set_video_track(VPEngine* e, int stream_index);
 void vp_engine_set_audio_track(VPEngine* e, int stream_index);
 int  vp_engine_video_tracks(VPEngine* e, VPStreamInfo* out, int max);

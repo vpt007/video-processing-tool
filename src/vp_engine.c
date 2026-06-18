@@ -67,6 +67,9 @@
 /* present_req modes for present_due_frame */
 enum { PR_NORMAL = 0, PR_NEWEST = 1, PR_OLDEST = 2 };
 
+/* max frames a single backward step may walk back (bounds the decode-thread ring) */
+#define BACK_MAX 16
+
 static double clampd(double v, double lo, double hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
@@ -128,7 +131,7 @@ static void pq_abort(PacketQueue* q) {
     pthread_mutex_unlock(&q->mu);
 }
 
-static void pq_resume(PacketQueue* q) {
+__attribute__((unused)) static void pq_resume(PacketQueue* q) {
     pthread_mutex_lock(&q->mu);
     q->abort = 0;
     pthread_mutex_unlock(&q->mu);
@@ -231,7 +234,7 @@ static void vfq_abort(VFrameQueue* q) {
     pthread_mutex_unlock(&q->mu);
 }
 
-static void vfq_resume(VFrameQueue* q) {
+__attribute__((unused)) static void vfq_resume(VFrameQueue* q) {
     pthread_mutex_lock(&q->mu);
     q->abort = 0;
     pthread_mutex_unlock(&q->mu);
@@ -422,8 +425,32 @@ struct VPEngine {
     pthread_mutex_t  drop_mu;
     double           drop_to;        /* media seconds of the target frame  */
 
+    /* backward frame-step: fps-FREE. Seek coarsely to a keyframe before the
+       current frame, decode forward keeping a small ring of the last back_n
+       frames whose pts < back_ref (the current frame's real pts); when the
+       current frame reappears, flush the ring oldest-first so the oldest IS the
+       target. No 1/fps arithmetic enters frame selection, so repeated presses
+       can't accumulate drift. back_n/back_ref guarded by drop_mu. */
+    atomic_int       back_active;    /* 1 = a backward step is resolving   */
+    int              back_n;         /* land this many frames before back_ref */
+    double           back_ref;       /* real pts of the frame we step back from */
+
+    /* seek handshake: request_seek bumps seek_epoch; the read thread sets
+       seek_epoch_done once it has flushed the queues for that seek. present
+       refuses to show a PR_OLDEST (step/seek) landing until they match, so it
+       can't grab a frame that was queued AHEAD of us before the flush — the race
+       that made a backward step jump forward to the next queued frame. */
+    atomic_uint      seek_epoch;
+    atomic_uint      seek_epoch_done;
+
     /* display request for present_due_frame (set by control fns) */
     atomic_int       present_req;    /* PR_NORMAL / PR_NEWEST / PR_OLDEST  */
+    atomic_int       step_fwd;       /* >0: PR_OLDEST consumes this many queued frames (frame-step) */
+
+    /* A paused step/seek can leave audio at a different spot than the displayed
+       video frame; resume must realign them or playback stalls. Set while
+       paused-and-navigating, consumed by the next play(). */
+    atomic_int       resync_on_play;
 
     /* snapshot: CPU copy of the last displayed RGB24 frame */
     pthread_mutex_t  snap_mu;
@@ -729,6 +756,13 @@ static void* video_thread(void* arg) {
     AVFrame*  flt = av_frame_alloc();
     int       pkt_serial = -1;
 
+    /* backward-step ring (see struct comment): holds the most recent frames
+       whose pts is still below back_ref, for the current back-step episode. */
+    AVFrame*  bring[BACK_MAX] = {0};
+    double    bring_pts[BACK_MAX];
+    int       bring_n = 0;
+    int       bring_serial = -1;   /* serial this ring belongs to */
+
     while (!atomic_load(&vp->quit)) {
 
         if (atomic_load(&vp->v_reopen)) {
@@ -778,6 +812,62 @@ static void* video_thread(void* arg) {
                             atomic_store(&vp->seek_drop, 0);  /* this is the target */
                         }
 
+                        /* backward step (fps-FREE selection): collect the last
+                           back_n frames that precede back_ref; when we reach the
+                           reference frame, flush the ring oldest-first so the
+                           oldest IS the target, then resume normal pushing.
+                           back_ref comes from a previously-presented frame, but a
+                           re-decode through the filter graph can reproduce its pts
+                           with small rounding differences, so the "have we reached
+                           the current frame yet?" test uses a half-frame tolerance
+                           (the same slack the forward seek-drop trusts) rather than
+                           near-exact equality, which re-decode rarely reproduces. */
+                        if (atomic_load(&vp->back_active) &&
+                            pkt_serial == pq_serial(&vp->videoq) && !isnan(pts)) {
+                            if (pkt_serial != bring_serial) {     /* new episode: reset */
+                                for (int i = 0; i < bring_n; i++) av_frame_free(&bring[i]);
+                                bring_n = 0; bring_serial = pkt_serial;
+                            }
+                            pthread_mutex_lock(&vp->drop_mu);
+                            double ref = vp->back_ref;
+                            int    bn  = vp->back_n;
+                            pthread_mutex_unlock(&vp->drop_mu);
+                            if (bn < 1) bn = 1;
+                            if (bn > BACK_MAX) bn = BACK_MAX;
+                            double half = (vp->fps > 0.0) ? 0.5 / vp->fps : 0.02;
+
+                            if (pts < ref - half) {               /* still before current */
+                                AVFrame* keep = av_frame_clone(flt);
+                                av_frame_unref(flt);
+                                if (!keep) continue;
+                                if (bring_n == bn) {              /* drop the oldest */
+                                    av_frame_free(&bring[0]);
+                                    for (int i = 1; i < bring_n; i++) {
+                                        bring[i-1]     = bring[i];
+                                        bring_pts[i-1] = bring_pts[i];
+                                    }
+                                    bring_n--;
+                                }
+                                bring[bring_n]     = keep;
+                                bring_pts[bring_n] = pts;
+                                bring_n++;
+                                continue;                         /* don't push yet */
+                            }
+                            /* reached the reference frame: flush ring (oldest = target) */
+                            for (int i = 0; i < bring_n; i++) {
+                                if (vfq_push(&vp->pictq, bring[i], bring_pts[i], pkt_serial) < 0) {
+                                    for (int j = i; j < bring_n; j++) av_frame_free(&bring[j]);
+                                    bring_n = 0;
+                                    atomic_store(&vp->back_active, 0);
+                                    av_frame_unref(flt);
+                                    goto out;
+                                }
+                            }
+                            bring_n = 0;
+                            atomic_store(&vp->back_active, 0);
+                            /* fall through: push the reference frame normally */
+                        }
+
                         AVFrame* rgb = av_frame_clone(flt);   /* refs same buffer */
                         av_frame_unref(flt);
                         if (vfq_push(&vp->pictq, rgb, pts, pkt_serial) < 0) {
@@ -788,11 +878,24 @@ static void* video_thread(void* arg) {
                 }
                 av_frame_unref(raw);
             }
-            if (is_eof) { avcodec_flush_buffers(vp->vctx); atomic_store(&vp->seek_drop, 0); }
+            if (is_eof) {
+                avcodec_flush_buffers(vp->vctx);
+                atomic_store(&vp->seek_drop, 0);
+                /* back_ref never reached (stepping back from at/near EOF): flush
+                   whatever the ring holds so the step still lands on a frame. */
+                if (atomic_load(&vp->back_active)) {
+                    for (int i = 0; i < bring_n; i++)
+                        if (vfq_push(&vp->pictq, bring[i], bring_pts[i], pkt_serial) < 0)
+                            av_frame_free(&bring[i]);
+                    bring_n = 0;
+                    atomic_store(&vp->back_active, 0);
+                }
+            }
         }
         av_packet_unref(pkt);
     }
 out:
+    for (int i = 0; i < bring_n; i++) av_frame_free(&bring[i]);
     av_packet_free(&pkt);
     av_frame_free(&raw);
     av_frame_free(&flt);
@@ -919,6 +1022,7 @@ static void* read_thread(void* arg) {
 
         /* ── seek ── */
         if (atomic_load(&vp->seek_req)) {
+            unsigned ep = atomic_load(&vp->seek_epoch);  /* the seek we're servicing */
             atomic_store(&vp->seek_req, 0);
             double t = vp->seek_to;
             /* frame-accurate landing only makes sense while paused (while
@@ -948,6 +1052,10 @@ static void* read_thread(void* arg) {
                 set_ext_clock(vp, t, !atomic_load(&vp->is_playing));
                 vp->display_pts = t;
             }
+            /* Flush for this seek is complete: let present resume. present will
+               now wait for the new-serial target frame (the queue is empty) and
+               can no longer grab a pre-seek frame. */
+            atomic_store(&vp->seek_epoch_done, ep);
             atomic_store(&vp->finished, 0);
             atomic_store(&vp->eof_reached, 0);
             eof_sent = 0;
@@ -1146,12 +1254,30 @@ unsigned int vp_engine_texture(VPEngine* vp, int* w, int* h) {
     return vp->tex;
 }
 
+static void request_seek(VPEngine* vp, double t, int precise);
+
 void vp_engine_set_vf(VPEngine* vp, const char* vf) {
     pthread_mutex_lock(&vp->fstr_mu);
     strncpy(vp->cur_vf, vf ? vf : "", sizeof(vp->cur_vf) - 1);
     vp->cur_vf[sizeof(vp->cur_vf)-1] = 0;
     pthread_mutex_unlock(&vp->fstr_mu);
     atomic_store(&vp->vf_rebuild, 1);
+    if (!atomic_load(&vp->is_playing)) vp_engine_refresh(vp);
+}
+
+void vp_engine_refresh(VPEngine* vp) {
+    /* Force the current frame back through the graph. While paused no packets
+       flow, so a precise re-seek to where we are makes the decoder re-emit the
+       current frame into the (new) filtergraph and present it. */
+    double t = vp->display_pts;
+    if (isnan(t) || t < 0) t = get_master_clock(vp);
+    if (isnan(t) || t < 0) t = 0;
+    atomic_store(&vp->step_fwd, 0);
+    if (!atomic_load(&vp->is_seeking))
+        atomic_store(&vp->present_req,
+                     atomic_load(&vp->is_playing) ? PR_NORMAL : PR_OLDEST);
+    request_seek(vp, t, atomic_load(&vp->is_playing) ? 0 : 1);
+    wake_read(vp);
 }
 
 void vp_engine_set_af(VPEngine* vp, const char* af) {
@@ -1162,6 +1288,7 @@ void vp_engine_set_af(VPEngine* vp, const char* af) {
     /* clear stale audio so the new filter doesn't play after queued PCM */
     ring_clear(&vp->pcm);
     atomic_store(&vp->af_rebuild, 1);
+    if (!atomic_load(&vp->is_playing)) vp_engine_refresh(vp);
 }
 
 void vp_engine_set_video_track(VPEngine* vp, int idx) {
@@ -1231,6 +1358,7 @@ static void request_seek(VPEngine* vp, double t, int precise) {
     pthread_mutex_lock(&vp->cmd_mu);
     vp->seek_to = t;
     atomic_store(&vp->seek_want_precise, precise ? 1 : 0);
+    atomic_fetch_add(&vp->seek_epoch, 1);   /* present waits for the flush */
     atomic_store(&vp->seek_req, 1);
     atomic_store(&vp->seek_pending, 1);
     pthread_cond_signal(&vp->cmd_cv);
@@ -1296,6 +1424,17 @@ static int present_due_frame(VPEngine* vp) {
     int newest = (req == PR_NEWEST) || (req == PR_NORMAL && isnan(master));
     int oldest = (req == PR_OLDEST);
 
+    /* A step/seek arms PR_OLDEST and then asks the read thread to seek. Until
+       that thread has flushed the queues, the frames sitting AHEAD of us (C+1,
+       C+2, ...) are still queued; showing one here would land us forward of
+       where we were and revert PR_OLDEST so the real target never appears — the
+       race that made a backward step jump to the next frame. Hold off until the
+       flush for the latest seek is done; then the queue is empty and present
+       waits for the true target as the oldest new-serial frame. */
+    if (oldest &&
+        atomic_load(&vp->seek_epoch) != atomic_load(&vp->seek_epoch_done))
+        return 0;
+
     AVFrame* chosen = NULL;
     double   chosen_pts = NAN;
 
@@ -1321,7 +1460,13 @@ static int present_due_frame(VPEngine* vp) {
 
         if (chosen) av_frame_free(&chosen);   /* skip the older frame */
         chosen = f; chosen_pts = pts;
-        if (oldest) break;                    /* exactly one frame */
+        if (oldest) {
+            /* A seek lands on exactly one frame (step_fwd == 0). A forward step
+               walks step_fwd frames forward in decode order, presenting the last. */
+            if (atomic_load(&vp->step_fwd) > 0 &&
+                atomic_fetch_sub(&vp->step_fwd, 1) - 1 > 0) continue;
+            break;
+        }
     }
     pthread_mutex_unlock(&vp->pictq.mu);
 
@@ -1330,8 +1475,23 @@ static int present_due_frame(VPEngine* vp) {
         upload_rgb(vp, chosen);
         keep_snapshot(vp, chosen);
         av_frame_free(&chosen);
-        if (oldest) atomic_store(&vp->present_req, PR_NORMAL);  /* consumed */
+        if (oldest && atomic_load(&vp->step_fwd) <= 0) {
+            /* A step/seek target just landed. While paused, the master clock is
+               the frozen ext clock, and a coarse back-step seek deliberately did
+               NOT move it — so sync it to the real frame now, otherwise
+               vp_engine_position() would report the stale/coarse time and the
+               scrubber would appear to jump. */
+            if (!isnan(chosen_pts) && !atomic_load(&vp->is_playing))
+                set_ext_clock(vp, chosen_pts, 1);
+            atomic_store(&vp->present_req, PR_NORMAL);   /* step/seek done */
+        }
         return 1;
+    }
+    /* nothing to present: if a forward step ran into EOF, don't stay stuck */
+    if (oldest && atomic_load(&vp->step_fwd) > 0 &&
+        vp->pictq.n == 0 && atomic_load(&vp->eof_reached)) {
+        atomic_store(&vp->step_fwd, 0);
+        atomic_store(&vp->present_req, PR_NORMAL);
     }
     return 0;
 }
@@ -1376,7 +1536,25 @@ void vp_engine_play(VPEngine* vp) {
         atomic_store(&vp->finished, 0);
         request_seek(vp, 0.0, 0);
     }
+    else if (atomic_load(&vp->resync_on_play)) {
+        /* A paused step/seek left audio away from the shown frame. Seek both
+           streams to the displayed frame so playback resumes in sync instead of
+           stalling while audio catches up, and anchor the clock there so the
+           first frames are timed from the displayed position, not a stale base. */
+        request_seek(vp, vp->display_pts, 0);
+        set_ext_clock(vp, vp->display_pts, 0);
+        atomic_store(&vp->resync_on_play, 0);
+        atomic_store(&vp->step_fwd, 0);
+        atomic_store(&vp->back_active, 0);
+        atomic_store(&vp->present_req, PR_NORMAL);
+        atomic_store(&vp->is_playing, 1);
+        wake_read(vp);
+        return;
+    }
+    atomic_store(&vp->resync_on_play, 0);
     set_ext_clock(vp, get_ext_clock(vp), 0);
+    atomic_store(&vp->step_fwd, 0);
+    atomic_store(&vp->back_active, 0);
     atomic_store(&vp->present_req, PR_NORMAL);
     atomic_store(&vp->is_playing, 1);
     wake_read(vp);
@@ -1398,6 +1576,8 @@ bool vp_engine_is_playing(VPEngine* vp) { return atomic_load(&vp->is_playing) !=
 
 void vp_engine_seek(VPEngine* vp, double seconds, bool precise) {
     int paused = !atomic_load(&vp->is_playing);
+    atomic_store(&vp->step_fwd, 0);          /* a seek overrides any pending step */
+    atomic_store(&vp->back_active, 0);       /* ...and any pending backward step */
     int p = (precise && paused) ? 1 : 0;
     /* Don't fight an in-progress scrub (it owns PR_NEWEST). Otherwise: paused
        lands on one frame (target if precise, else keyframe); playing stays
@@ -1418,13 +1598,39 @@ void vp_engine_seek_frame(VPEngine* vp, int64_t frame) {
 
 void vp_engine_step(VPEngine* vp, int delta) {
     vp_engine_pause(vp);
-    int64_t cur = vp_engine_frame_index(vp);
-    int64_t tgt = cur + delta;
-    if (tgt < 0) tgt = 0;
-    vp_engine_seek_frame(vp, tgt);
+    if (delta == 0) return;
+    /* Stepping while paused desyncs audio from the shown frame; the next play()
+       must realign A/V or it stalls waiting for audio to catch up. */
+    atomic_store(&vp->resync_on_play, 1);
+
+    if (delta > 0) {
+        /* Forward: the next frames are already decoded and queued in order, so
+           walk them exactly — no seek, no fps math, no keyframe guesswork. */
+        atomic_store(&vp->step_fwd, delta);
+        atomic_store(&vp->present_req, PR_OLDEST);
+        wake_read(vp);                       /* keep the queue topped up */
+    } else {
+        /* Backward: can't decode in reverse, so do a PRECISE seek one frame
+           before the current frame. The engine's seek-drop already lands exactly
+           on the first frame at/after the target (half-frame tolerance), and the
+           epoch gate in present stops it grabbing a queued forward frame before
+           the flush. We anchor on display_pts (the real pts of the frame on
+           screen) and subtract whole frame-durations; after landing, display_pts
+           becomes the real landed pts, so repeated presses re-anchor on an actual
+           frame and don't accumulate drift. */
+        int n = -delta;
+        if (n < 1) n = 1;
+        double dt     = (vp->fps > 0.0) ? 1.0 / vp->fps : 0.04;
+        double target = vp->display_pts - (double)n * dt;
+        if (target < 0.0) target = 0.0;
+        atomic_store(&vp->step_fwd, 0);
+        vp_engine_seek(vp, target, true);   /* precise; we're already paused */
+    }
 }
 
 void vp_engine_scrub_begin(VPEngine* vp) {
+    atomic_store(&vp->step_fwd, 0);
+    atomic_store(&vp->back_active, 0);
     atomic_store(&vp->is_seeking, 1);
     atomic_store(&vp->present_req, PR_NEWEST);
 }
@@ -1434,6 +1640,8 @@ void vp_engine_scrub_end(VPEngine* vp) {
     atomic_store(&vp->present_req,
                  atomic_load(&vp->is_playing) ? PR_NORMAL : PR_OLDEST);
     set_ext_clock(vp, vp->display_pts, !atomic_load(&vp->is_playing));
+    if (!atomic_load(&vp->is_playing))
+        atomic_store(&vp->resync_on_play, 1);   /* realign A/V when play resumes */
 }
 
 /* ── rate / volume ────────────────────────────────────────────────────────── */
@@ -1452,7 +1660,8 @@ void vp_engine_set_rate(VPEngine* vp, double rate) {
 double vp_engine_get_rate(VPEngine* vp) { return atomic_load(&vp->rate_milli) / 1000.0; }
 
 void vp_engine_set_volume(VPEngine* vp, float v) {
-    if (v < 0.0f) v = 0.0f; if (v > 1.0f) v = 1.0f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
     atomic_store(&vp->volume_milli, (int)(v * 1000.0f + 0.5f));
 }
 
@@ -1474,6 +1683,14 @@ void vp_engine_clear_loop(VPEngine* vp) { atomic_store(&vp->loop_on, 0); }
 /* ── queries ──────────────────────────────────────────────────────────────── */
 
 double vp_engine_position(VPEngine* vp) {
+    /* While paused, the displayed video frame is the source of truth — the audio
+       clock may sit elsewhere (e.g. a coarse back-step seek left it at an earlier
+       keyframe), and reporting that would make the scrubber jump to a "random"
+       spot even though the correct frame is on screen. */
+    if (!atomic_load(&vp->is_playing)) {
+        double d = vp->display_pts;
+        if (!isnan(d)) return d < 0 ? 0 : d;
+    }
     double m = get_master_clock(vp);
     if (isnan(m)) m = vp->display_pts;
     return m < 0 ? 0 : m;

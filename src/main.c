@@ -66,6 +66,11 @@ ImFont *icon_font;
 	if (igIsItemHovered(ImGuiHoveredFlags_DelayShort)) {                   \
 		igSetTooltip(x);                                               \
 	}
+
+
+/* Video Player  widget */
+
+
 typedef struct {
 	ImVec2 aspect_ratio;
 	ImVec2 scale;
@@ -124,6 +129,7 @@ unsigned int vp_get_texture(VPWidget *vp, int *w, int *h)
 {
 	return vp_engine_texture(vp->eng, w, h);
 }
+
 void vp_render(VPWidget *ctx, float w, float h)
 {
 	if(!ctx){
@@ -215,6 +221,9 @@ void vp_render(VPWidget *ctx, float w, float h)
 	}
 	igPopID();
 }
+
+
+/* Video Player widget end*/
 
 VideoConfig video_config                    = {0};
 
@@ -489,12 +498,14 @@ typedef struct {
 	char *tooltip;
 	void (*on_click)(void *);
 } BtnItem;
+
 typedef struct {
 	char *label;
 	bool *status;
 	char *tooltip;
 	void (*on_click)(void *);
 } ChkBtnItem;
+
 typedef struct {
 	char *label;
 	int id;
@@ -502,10 +513,8 @@ typedef struct {
 	void (*on_click)(void *);
 	void *user_data;
 } RadioBtnItem;
-typedef struct {
-	const char *path;
-	void *thumbnail;
-} VideoFile;
+
+
 bool jh_chk_button(const char *label, bool *status, ImVec2 size)
 {
 	if (*status) {
@@ -641,7 +650,7 @@ void TimelineTrimWidget(const char *label, float *trim_start, float *trim_end,
 	if (out_scrub)
 		*out_scrub = (dragging == 2) ? *trim_end : *trim_start;
 }
-#include "test.c"
+/* #include "test.c" */
 #include "ve_export.c"
 void handle_crop(void *ud)
 {
@@ -707,13 +716,11 @@ void render_tools()
 {
 	igBeginGroup();
 	static BtnItem items[] = {
-	    {i_vpu_icon_thumbnail, "Add a cover thumbnail",
-	     handle_add_thumbnail},
+	    {i_vpu_icon_thumbnail, "Add a cover thumbnail",handle_add_thumbnail},
 	    {i_vpu_icon_crop, "Toggle crop", handle_crop},
-	    /* {i_vpu_icon_trim, "Trim using the timeline below",handle_trim_noop}, */
+	    {i_vpu_icon_trim, "Trim using the timeline below",handle_trim_noop},
 	    {i_vpu_icon_add_subs, "Add a subtitle track", handle_add_subtitle},
-	    {i_vpu_icon_delete_sub, "Remove a subtitle track",
-	     handle_remove_subtitle},
+	    {i_vpu_icon_delete_sub, "Remove a subtitle track",handle_remove_subtitle},
 	};
 	int n = ARR_LEN(items);
 	ImVec2 btn_size = {64,64};
@@ -826,7 +833,6 @@ void render_single_click_items(ImVec2 size)
 	/* Reserve a fixed-height row for the custom-angle slider so
 	   showing/hiding it never reflows everything below it. */
 	{
-		float row_h = igGetFrameHeight();
 		ImVec2 cur = igGetCursorScreenPos();
 		if (selected_rotation_button == ROTATE_CUSTOM) {
 			static float angle_deg = 0.0f;
@@ -1060,12 +1066,9 @@ void render_single_click_items(ImVec2 size)
 	{
 		if (igBeginListBox("##list_video_info", (ImVec2){-1, 100})) {
 			for (int i = 0; i < audio_track_count; i++) {
-				snprintf(tmp_buffer, sizeof(tmp_buffer),
-					 "%s %s", i_music,
-					 audio_tracks[i].lang);
+				snprintf(tmp_buffer, sizeof(tmp_buffer),"%s %s", i_music,audio_tracks[i].lang);
 				igPushID_Int(i);
-				if(igSelectable_Bool(tmp_buffer, true, 0,
-						  (ImVec2){0, 0})){
+				if(igSelectable_Bool(tmp_buffer, true, 0,(ImVec2){0, 0})){
 					vp_engine_set_audio_track(vp->eng,audio_tracks[i].index);
 				}
 				igPopID();
@@ -1153,12 +1156,20 @@ void render_single_click_items(ImVec2 size)
 	}
 
 	export_poll();
-	igSetCursorPosY(igGetWindowHeight() - 50 -
-			igGetStyle()->WindowPadding.y);
+	/* igSetCursorPosY(igGetWindowHeight() - 50 - */
+	/* 		igGetStyle()->WindowPadding.y); */
 	if (export_active()) {
 		double f = export_fraction();
+		static double pre_f = 0.0;
+		if (f < pre_f) f = pre_f;
+		else pre_f = f;
 		char ov[32];
-		snprintf(ov, sizeof(ov), "%.0f%%", f * 100.0);
+		/* snprintf(ov, sizeof(ov), "%.0f%%", f * 100.0); */
+
+		int p = (int)(f * 100.0 + 0.5);
+		snprintf(ov, sizeof(ov), "%d%%", p);
+
+
 		float cancel_w = 100.0f;
 		float bar_w = igGetContentRegionAvail().x - cancel_w - spacing;
 		if (bar_w < 50.0f)
@@ -1346,6 +1357,7 @@ void reset_edit_state(void)
 }
 void populate_user_thumbnail(const char *path) { (void)path; }
 
+
 void drop_callback(GLFWwindow *window, int count, const char **paths)
 {
 	if (count > 1) {
@@ -1388,7 +1400,6 @@ void drop_callback(GLFWwindow *window, int count, const char **paths)
 cleanup:
 	error_message = "File not supported";
 }
-
 int main(int argc, char *argv[])
 {
 	if (!glfwInit())
@@ -1412,11 +1423,14 @@ int main(int argc, char *argv[])
 	window =
 	    glfwCreateWindow((int)(WIDTH * 16),
 			     (int)(HEIGHT * 9), APP_TITLE, NULL, NULL);
+
 	if (!window) {
 		printf("Failed to create window! Terminating!\n");
 		glfwTerminate();
 		return -1;
 	}
+	
+	glfwSetWindowSizeLimits(window, WIDTH * 16, HEIGHT * 9,GLFW_DONT_CARE, GLFW_DONT_CARE);
 	glfwSetWindowAspectRatio(window, 16, 9);
 	glfwMakeContextCurrent(window);
 	gladLoadGL(glfwGetProcAddress);
@@ -1535,10 +1549,9 @@ ImFontConfig_destroy(icon_cfg);
 						  470);
 					igEndGroup();
 					igSameLine(0.0f, -1.0f);
-					// igBeginDisabled(!thumbnail_texture);
-					render_single_click_items(
-					    (ImVec2){w, 0});
-					// igEndDisabled();
+					igBeginDisabled(!vp);
+					render_single_click_items((ImVec2){w, 0});
+					igEndDisabled();
 					error_dialog_render();
 					igEndTabItem();
 				}
