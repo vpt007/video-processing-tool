@@ -17,13 +17,12 @@
 #include <string.h>
 #include <time.h>
 #include <errno.h>
-
+#include <limits.h>
 #ifdef _WIN32
     #include <windows.h>
     #include <direct.h>
     #include <process.h>
     #include <io.h>
-    #pragma comment(lib, "ws2_32.lib")
     #define OS_SEP "\\"
     #define OS_SEP_CHAR '\\'
     #define OS_NAME "windows"
