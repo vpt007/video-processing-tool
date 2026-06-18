@@ -50,6 +50,9 @@ typedef struct {
 	float ui_seek_val;
 } VPWidget;
 
+void drop_callback(GLFWwindow *window, int count, const char **paths);
+void reset_edit_state(void);
+
 VPWidget *vp = NULL;
 GLFWwindow *window;
 ImFont *icon_font;
