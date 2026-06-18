@@ -51,6 +51,7 @@
 #define OS_COPY_BUF 65536
 #endif
 
+#define os_path_join(out,size,...) os_path__join(out,size,__VA_ARGS__,NULL)
 static inline int os_lasterr(void) {
 #ifdef _WIN32
     return (int)GetLastError();
@@ -59,9 +60,29 @@ static inline int os_lasterr(void) {
 #endif
 }
 
+static char *os_get_executable_path(char *path, size_t size) {
+#ifdef _WIN32
+    if (GetModuleFileNameA(NULL, path, (DWORD)size) == 0)
+        return NULL;
+    return path;
 
-#define os_path_join(out,size,...) os_path__join(out,size,__VA_ARGS__,NULL)
+#elif __linux__
+    ssize_t len = readlink("/proc/self/exe", path, size - 1);
+    if (len == -1)
+        return NULL;
+    path[len] = '\0';
+    return path;
 
+#elif __APPLE__
+    uint32_t s = (uint32_t)size;
+    if (_NSGetExecutablePath(path, &s) != 0)
+        return NULL;
+    return path;
+
+#else
+    return NULL;
+#endif
+}
 
 static inline char *os_getcwd(char *buf, int size) {
     if (!buf || size <= 0) return NULL;
