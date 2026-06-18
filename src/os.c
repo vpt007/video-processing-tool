@@ -35,13 +35,13 @@
     #include <sys/utsname.h>
     #include <pwd.h>
     #include <fcntl.h>
-    #include <limits.h>
     #define OS_SEP "/"
     #define OS_SEP_CHAR '/'
     #define OS_PATHMAX PATH_MAX
     #ifdef __APPLE__
         #define OS_NAME "darwin"
         #include <sys/sysctl.h>
+    	#include <mach-o/dyld.h>
     #else
         #define OS_NAME "linux"
     #endif
