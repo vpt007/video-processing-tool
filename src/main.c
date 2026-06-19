@@ -23,6 +23,8 @@
 #include "icon_moon.h"
 #include "icon_font.h"
 #include "os.c"
+#include "vp_thumb.c"
+#include "thumb_strip.c"
 
 #define JRGB(R,G,B) (ImVec4){(float)R/255,(float)G/255,(float)B/255,1.0f}
 #ifdef IMGUI_HAS_IMSTR
@@ -48,6 +50,8 @@ typedef struct {
 	char ui_af[JH_BUFFER_MAX];
 	int ui_seek_active;
 	float ui_seek_val;
+	float ui_seek_last_sent;
+	double ui_last_seek_t;
 } VPWidget;
 
 void drop_callback(GLFWwindow *window, int count, const char **paths);
@@ -200,13 +204,27 @@ void vp_render(VPWidget *ctx, float w, float h)
 			vp->ui_seek_active = 1;
 			vp_engine_scrub_begin(e);
 			vp_engine_pause(e);
+			vp->ui_seek_last_sent = -1.0f;
+			vp->ui_last_seek_t = -1.0;
 		}
 		vp->ui_seek_val = sval;
-		vp_engine_seek(e, sval,
-			      true); /* fast/keyframe while dragging */
+	}
+	/* While dragging, emit FAST (keyframe) seeks throttled to ~25/s so the
+	   decoder isn't flooded with accurate seeks (which causes the video to
+	   hang and trail the audio until the backlog drains). */
+	if (vp->ui_seek_active) {
+		double now = glfwGetTime();
+		if (vp->ui_seek_val != vp->ui_seek_last_sent &&
+		    (vp->ui_last_seek_t < 0.0 ||
+		     now - vp->ui_last_seek_t >= 0.04)) {
+			vp_engine_seek(e, vp->ui_seek_val, false);
+			vp->ui_seek_last_sent = vp->ui_seek_val;
+			vp->ui_last_seek_t = now;
+		}
 	}
 	if (vp->ui_seek_active && !igIsItemActive()) { /* drag released */
 		vp->ui_seek_active = 0;
+		vp_engine_seek(e, vp->ui_seek_val, true); /* land exactly */
 		vp_engine_scrub_end(e);
 		vp_engine_play(e);
 	}
@@ -236,6 +254,7 @@ int has_audio_src                           = 0;
 
 VPStreamInfo audio_tracks[32];
 int audio_track_count                       = 0;
+bool audio_removed[32]                      = {0};
 
 int crop_enabled                            = 0;
 float crop_l                                = 0.0f;
@@ -518,9 +537,7 @@ typedef struct {
 bool jh_chk_button(const char *label, bool *status, ImVec2 size)
 {
 	if (*status) {
-igPushStyleColor_Vec4(
-    ImGuiCol_Button,
-    (ImVec4){22.0f/255.0f, 222.0f/255.0f, 52.0f/255.0f, 1.0f});
+		igPushStyleColor_Vec4(ImGuiCol_Button,JRGB(22.0f,222.0f,53.0f));
 	}
 	bool clicked = igButton(label, size);
 	if (*status) {
@@ -531,13 +548,13 @@ igPushStyleColor_Vec4(
 	}
 	return *status;
 }
+
 bool jh_radio_button(const char *label, int *v, int id, ImVec2 size)
 {
 	bool is_selected = (*v == id);
 	if (is_selected) {
-		const ImVec4 *pressed_color =
-		    igGetStyleColorVec4(ImGuiCol_ButtonActive);
-		igPushStyleColor_Vec4(ImGuiCol_Button, *pressed_color);
+
+		igPushStyleColor_Vec4(ImGuiCol_Button,JRGB(22.0f,222.0f,53.0f));
 	}
 	bool clicked = igButton(label, size);
 	if (is_selected) {
@@ -553,6 +570,46 @@ bool jh_radio_button(const char *label, int *v, int id, ImVec2 size)
 	}
 	return false;
 }
+
+/* Filmstrip texture cache for the trim track. The worker (thumb_strip.c)
+   produces RGB24 cells; we upload each to a GL texture once, on the UI thread,
+   and free them all on every new file load via ts_tex_reset(). */
+static unsigned int g_ts_tex[TS_CELLS];
+static int          g_ts_tex_built[TS_CELLS];
+static int          g_ts_tex_w[TS_CELLS], g_ts_tex_h[TS_CELLS];
+
+static unsigned int ts_upload_tex(const uint8_t *rgb, int w, int h)
+{
+	if (!rgb || w <= 0 || h <= 0)
+		return 0;
+	unsigned int tex = 0;
+	glGenTextures(1, &tex);
+	glBindTexture(GL_TEXTURE_2D, tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB,
+		     GL_UNSIGNED_BYTE, rgb);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	return tex;
+}
+
+/* Must run on the main/GL thread. Called from reset_edit_state on load. */
+void ts_tex_reset(void)
+{
+	for (int i = 0; i < TS_CELLS; i++) {
+		if (g_ts_tex_built[i] && g_ts_tex[i])
+			glDeleteTextures(1, &g_ts_tex[i]);
+		g_ts_tex[i] = 0;
+		g_ts_tex_built[i] = 0;
+		g_ts_tex_w[i] = g_ts_tex_h[i] = 0;
+	}
+}
+
+#define TL_HEADER_W 132.0f
+
 void TimelineTrimWidget(const char *label, float *trim_start, float *trim_end,
 			float duration, ImVec2 size, int *out_dragging,
 			float *out_scrub)
@@ -567,8 +624,16 @@ void TimelineTrimWidget(const char *label, float *trim_start, float *trim_end,
 	float hw = 12.0f;
 	float y0 = pos.y;
 	float y1 = pos.y + h;
-	float sx = pos.x + (*trim_start / duration) * w;
-	float ex = pos.x + (*trim_end / duration) * w;
+
+	/* Time axis lives to the right of a fixed-width header column, exactly
+	   like the audio tracks, so both share one x->time mapping. */
+	float tx0 = pos.x + TL_HEADER_W;
+	float tw = w - TL_HEADER_W;
+	if (tw < 10.0f)
+		tw = 10.0f;
+
+	float sx = tx0 + (*trim_start / duration) * tw;
+	float ex = tx0 + (*trim_end / duration) * tw;
 	float min_px = hw * 2 + 4.0f; // minimum pixel gap between handles
 	bool hit_left = mouse.x >= sx - hw && mouse.x <= sx + hw &&
 			mouse.y >= y0 && mouse.y <= y1;
@@ -579,6 +644,7 @@ void TimelineTrimWidget(const char *label, float *trim_start, float *trim_end,
 	igSetCursorScreenPos(pos);
 	igSetNextItemAllowOverlap();
 	igDummy(size);
+	ImVec2 after = igGetCursorScreenPos();
 	if (igIsMouseClicked_Bool(0, false)) {
 		if (hit_right) {
 			dragging = 2;
@@ -593,25 +659,25 @@ void TimelineTrimWidget(const char *label, float *trim_start, float *trim_end,
 		dragging = 0;
 	if (igIsMouseDown_Nil(0) && dragging > 0) {
 		if (dragging == 1) {
-			float t = (mouse.x - pos.x) / w * duration;
-			float min_start = (hw / w) * duration;
-			float max_start = *trim_end - (min_px / w * duration);
+			float t = (mouse.x - tx0) / tw * duration;
+			float min_start = (hw / tw) * duration;
+			float max_start = *trim_end - (min_px / tw * duration);
 			t = fmaxf(min_start, fminf(t, max_start));
 			*trim_start = t;
 			igSetMouseCursor(ImGuiMouseCursor_ResizeEW);
 		} else if (dragging == 2) {
-			float t = (mouse.x - pos.x) / w * duration;
-			float min_end = *trim_start + (min_px / w * duration);
-			float max_end = duration - (hw / w) * duration;
+			float t = (mouse.x - tx0) / tw * duration;
+			float min_end = *trim_start + (min_px / tw * duration);
+			float max_end = duration - (hw / tw) * duration;
 			t = fminf(max_end, fmaxf(t, min_end));
 			*trim_end = t;
 			igSetMouseCursor(ImGuiMouseCursor_ResizeEW);
 		} else if (dragging == 3) {
 			float len = *trim_end - *trim_start;
 			float new_sx = mouse.x - drag_offset;
-			float t = (new_sx - pos.x) / w * duration;
-			float t_min = (hw / w) * duration;
-			float t_max = duration - len - (hw / w) * duration;
+			float t = (new_sx - tx0) / tw * duration;
+			float t_min = (hw / tw) * duration;
+			float t_max = duration - len - (hw / tw) * duration;
 			t = fmaxf(t_min, fminf(t, t_max));
 			*trim_start = t;
 			*trim_end = t + len;
@@ -623,12 +689,79 @@ void TimelineTrimWidget(const char *label, float *trim_start, float *trim_end,
 		else if (hit_body)
 			igSetMouseCursor(ImGuiMouseCursor_ResizeAll);
 	}
-	sx = pos.x + (*trim_start / duration) * w;
-	ex = pos.x + (*trim_end / duration) * w;
-	ImDrawList_AddRectFilled(dl, (ImVec2){pos.x, y0},
-				 (ImVec2){pos.x + w, y1}, 0xFF555555, 4.0f, 0);
+	sx = tx0 + (*trim_start / duration) * tw;
+	ex = tx0 + (*trim_end / duration) * tw;
+	ImDrawList_PushClipRect(dl, (ImVec2){pos.x, y0},
+				(ImVec2){pos.x + w, y1}, true);
+
+	/* left header column (matches the audio track chips) */
+	ImDrawList_AddRectFilled(dl, (ImVec2){pos.x, y0}, (ImVec2){tx0, y1},
+				 IM_COL32(18, 18, 22, 255), 0, 0);
+
+	/* base layer: filmstrip thumbnails, tiled edge-to-edge (cover fit, no
+	   gaps). A placeholder fill is drawn only until a cell's texture is
+	   ready, so the common path is just one textured quad per cell. */
+	int tsn = ts_count();
+	if (tsn > 0) {
+		float cellw = tw / (float)tsn;
+		for (int ci = 0; ci < tsn; ci++) {
+			float cx0 = tx0 + ci * cellw;
+			float cx1 = cx0 + cellw;
+			if (!g_ts_tex_built[ci] && ts_cell_ready(ci) == 1) {
+				int tw2 = 0, thh = 0;
+				const uint8_t *rgb =
+				    ts_cell_rgb(ci, &tw2, &thh);
+				if (rgb) {
+					g_ts_tex[ci] =
+					    ts_upload_tex(rgb, tw2, thh);
+					g_ts_tex_w[ci] = tw2;
+					g_ts_tex_h[ci] = thh;
+					g_ts_tex_built[ci] = 1;
+				}
+			}
+			if (g_ts_tex_built[ci] && g_ts_tex[ci]) {
+				float cellAR = (cx1 - cx0) / (y1 - y0);
+				float texAR = (float)g_ts_tex_w[ci] /
+					      (float)g_ts_tex_h[ci];
+				float u0 = 0, v0 = 0, u1 = 1, v1 = 1;
+				if (texAR > cellAR) {
+					float uvw = cellAR / texAR;
+					u0 = (1.0f - uvw) * 0.5f;
+					u1 = 1.0f - u0;
+				} else {
+					float uvh = texAR / cellAR;
+					v0 = (1.0f - uvh) * 0.5f;
+					v1 = 1.0f - v0;
+				}
+				ImTextureRef ref = {0};
+				ref._TexID =
+				    (ImTextureID)(uintptr_t)g_ts_tex[ci];
+				ImDrawList_AddImage(
+				    dl, ref, (ImVec2){cx0, y0},
+				    (ImVec2){cx1, y1}, (ImVec2){u0, v0},
+				    (ImVec2){u1, v1}, 0xFFFFFFFF);
+			} else {
+				ImDrawList_AddRectFilled(
+				    dl, (ImVec2){cx0, y0}, (ImVec2){cx1, y1},
+				    IM_COL32(28, 28, 32, 255), 0, 0);
+			}
+		}
+	} else {
+		ImDrawList_AddRectFilled(dl, (ImVec2){tx0, y0},
+					 (ImVec2){tx0 + tw, y1}, 0xFF555555,
+					 0.0f, 0);
+	}
+
+	/* dim trimmed-out regions, tint the kept selection translucently so the
+	   thumbnails still read through it */
+	ImDrawList_AddRectFilled(dl, (ImVec2){tx0, y0}, (ImVec2){sx, y1},
+				 IM_COL32(0, 0, 0, 150), 0, 0);
+	ImDrawList_AddRectFilled(dl, (ImVec2){ex, y0}, (ImVec2){tx0 + tw, y1},
+				 IM_COL32(0, 0, 0, 150), 0, 0);
 	ImDrawList_AddRectFilled(dl, (ImVec2){sx, y0}, (ImVec2){ex, y1},
-				 0xFF2288FF, 0.0f, 0);
+				 IM_COL32(34, 136, 255, 64), 0, 0);
+	ImDrawList_AddRect(dl, (ImVec2){sx, y0}, (ImVec2){ex, y1},
+			   IM_COL32(34, 136, 255, 255), 0.0f, 2.0f, 0);
 	ImDrawList_AddRectFilled(dl, (ImVec2){sx - hw, y0},
 				 (ImVec2){sx + hw, y1}, 0xFFCCCCCC, 4.0f, 0);
 	ImDrawList_AddRect(dl, (ImVec2){sx - hw, y0}, (ImVec2){sx + hw, y1},
@@ -645,6 +778,15 @@ void TimelineTrimWidget(const char *label, float *trim_start, float *trim_end,
 		ImDrawList_AddCircleFilled(
 		    dl, (ImVec2){ex, y0 + h * 0.5f + (i - 1) * 5.0f}, 2.0f,
 		    0xFF333333, 8);
+	ImDrawList_PopClipRect(dl);
+
+	/* header label; restore the layout cursor so downstream items are
+	   unaffected by our manual positioning */
+	igSetCursorScreenPos((ImVec2){pos.x + 8.0f,
+				      y0 + (h - igGetTextLineHeight()) * 0.5f});
+	igText("%s Video", i_vpu_icon_thumbnail);
+	igSetCursorScreenPos(after);
+
 	if (out_dragging)
 		*out_dragging = dragging;
 	if (out_scrub)
@@ -652,6 +794,244 @@ void TimelineTrimWidget(const char *label, float *trim_start, float *trim_end,
 }
 /* #include "test.c" */
 #include "ve_export.c"
+#include "audio_wave.c"
+
+/* Waveform texture cache (UI layer keeps the GL bits; audio_wave.c stays pure
+   CPU). Each track's envelope is rasterized into one alpha texture the first
+   time it becomes ready, then blitted (and tinted) every frame instead of
+   re-emitting hundreds of line segments. Freed on every new file load. */
+#define WAVE_TEX_W 1024
+#define WAVE_TEX_H 64
+static unsigned int g_wave_tex[32];
+static int          g_wave_tex_built[32];
+static unsigned int build_wave_texture(const float *pk, int npk)
+{
+	if (!pk || npk <= 0)
+		return 0;
+	unsigned char *px = calloc((size_t)WAVE_TEX_W * WAVE_TEX_H * 4, 1);
+	if (!px)
+		return 0;
+	for (int x = 0; x < WAVE_TEX_W; x++) {
+		int b = (int)((long long)x * npk / WAVE_TEX_W);
+		if (b < 0)
+			b = 0;
+		else if (b >= npk)
+			b = npk - 1;
+		float a = pk[b];
+		if (a < 0.0f)
+			a = 0.0f;
+		else if (a > 1.0f)
+			a = 1.0f;
+		int bar = (int)(a * (WAVE_TEX_H - 1) + 0.5f);
+		if (bar < 1 && a > 1e-4f)
+			bar = 1;
+		for (int dy = 0; dy <= bar; dy++) {
+			int y = WAVE_TEX_H - 1 - dy;
+			if (y < 0 || y >= WAVE_TEX_H)
+				continue;
+			unsigned char *p =
+			    px + ((size_t)y * WAVE_TEX_W + x) * 4;
+			p[0] = p[1] = p[2] = p[3] = 255;
+		}
+	}
+	unsigned int tex = 0;
+	glGenTextures(1, &tex);
+	glBindTexture(GL_TEXTURE_2D, tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, WAVE_TEX_W, WAVE_TEX_H, 0,
+		     GL_RGBA, GL_UNSIGNED_BYTE, px);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	free(px);
+	return tex;
+}
+static unsigned int build_wave_texture1(const float *pk, int npk)
+{
+	if (!pk || npk <= 0)
+		return 0;
+	unsigned char *px = calloc((size_t)WAVE_TEX_W * WAVE_TEX_H * 4, 1);
+	if (!px)
+		return 0;
+	int half = WAVE_TEX_H / 2;
+	for (int x = 0; x < WAVE_TEX_W; x++) {
+		int b = (int)((long long)x * npk / WAVE_TEX_W);
+		if (b < 0)
+			b = 0;
+		else if (b >= npk)
+			b = npk - 1;
+		float a = pk[b];
+		if (a < 0.0f)
+			a = 0.0f;
+		else if (a > 1.0f)
+			a = 1.0f;
+		int bar = (int)(a * (half - 1) + 0.5f);
+		if (bar < 1 && a > 1e-4f)
+			bar = 1;
+		for (int dy = -bar; dy <= bar; dy++) {
+			int y = half + dy;
+			if (y < 0 || y >= WAVE_TEX_H)
+				continue;
+			unsigned char *p =
+			    px + ((size_t)y * WAVE_TEX_W + x) * 4;
+			p[0] = p[1] = p[2] = p[3] = 255; /* white, opaque */
+		}
+	}
+	unsigned int tex = 0;
+	glGenTextures(1, &tex);
+	glBindTexture(GL_TEXTURE_2D, tex);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, WAVE_TEX_W, WAVE_TEX_H, 0,
+		     GL_RGBA, GL_UNSIGNED_BYTE, px);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	free(px);
+	return tex;
+}
+
+/* Must run on the main/GL thread. Called from reset_edit_state on load. */
+void wave_tex_reset(void)
+{
+	for (int i = 0; i < 32; i++) {
+		if (g_wave_tex_built[i] && g_wave_tex[i])
+			glDeleteTextures(1, &g_wave_tex[i]);
+		g_wave_tex[i] = 0;
+		g_wave_tex_built[i] = 0;
+	}
+}
+
+#define AUDIO_TL_MAX_VISIBLE_ROWS 3
+
+static void AudioTracksTimeline(float width, float trim_start, float trim_end,
+				float dur)
+{
+	/* const float H = 23.0f, pad = 6.0f, btn = 30.0f; */
+	const float H = 23.0f, pad = 6.0f, btn = 20.0f;
+	if (dur <= 0.0f)
+		dur = 1.0f;
+	if (!vp || audio_track_count <= 0) {
+		igTextDisabled("No audio tracks");
+		return;
+	}
+
+	float sp = igGetStyle()->ItemSpacing.y;
+	float stride = H + sp;
+	int vis = audio_track_count < AUDIO_TL_MAX_VISIBLE_ROWS
+		      ? audio_track_count
+		      : AUDIO_TL_MAX_VISIBLE_ROWS;
+	float child_h = vis * stride + sp;
+
+	igPushStyleVar_Vec2(ImGuiStyleVar_WindowPadding, (ImVec2){0, 0});
+	igPushStyleVar_Vec2(ImGuiStyleVar_ItemSpacing,(ImVec2){0, 0});
+	igBeginChild_Str("##audio_tracks_scroll", (ImVec2){width, child_h}, 0,
+			 0);
+	ImDrawList *dl = igGetWindowDrawList();
+	double pos = vp_engine_position(vp->eng);
+
+	for (int i = 0; i < audio_track_count; i++) {
+		igPushID_Int(i);
+		ImVec2 o = igGetCursorScreenPos();
+		float x0 = o.x + TL_HEADER_W, x1 = o.x + width, ww = x1 - x0;
+		if (ww < 10.0f)
+			ww = 10.0f;
+		bool removed = audio_removed[i];
+		int state = aw_ready(i);
+
+		ImU32 bg = removed ? IM_COL32(38, 38, 42, 255)
+				   : IM_COL32(52, 52, 60, 255);
+		ImDrawList_AddRectFilled(dl, (ImVec2){x0, o.y},
+					 (ImVec2){x1, o.y + H}, bg, 0, 0);
+		ImDrawList_AddRectFilled(dl, o, (ImVec2){o.x + TL_HEADER_W,
+							 o.y + H},
+					 IM_COL32(18, 18, 22, 255), 0, 0);
+
+		ImDrawList_PushClipRect(dl, (ImVec2){x0, o.y},
+					(ImVec2){x1, o.y + H}, true);
+
+		if (state == 1) {
+			if (!g_wave_tex_built[i]) {
+				int npk = 0;
+				const float *pk = aw_peaks(i, &npk);
+				g_wave_tex[i] = build_wave_texture(pk, npk);
+				g_wave_tex_built[i] = 1;
+			}
+			if (g_wave_tex[i]) {
+				ImTextureRef ref = {0};
+				ref._TexID =
+				    (ImTextureID)(uintptr_t)g_wave_tex[i];
+				ImU32 wcol = removed
+						 ? IM_COL32(110, 110, 118, 255)
+						 : IM_COL32(90, 170, 255, 255);
+				ImDrawList_AddImage(
+				    dl, ref, (ImVec2){x0, o.y},
+				    (ImVec2){x1, o.y + H},
+				    (ImVec2){0, 0}, (ImVec2){1, 1}, wcol);
+			}
+		}
+
+		if (trim_start > 0.0f) {
+			float xs = x0 + (trim_start / dur) * ww;
+			ImDrawList_AddRectFilled(dl, (ImVec2){x0, o.y},
+						 (ImVec2){xs, o.y + H},
+						 IM_COL32(0, 0, 0, 120), 0, 0);
+		}
+		if (trim_end > 0.0f && trim_end < dur) {
+			float xe = x0 + (trim_end / dur) * ww;
+			ImDrawList_AddRectFilled(dl, (ImVec2){xe, o.y},
+						 (ImVec2){x1, o.y + H},
+						 IM_COL32(0, 0, 0, 120), 0, 0);
+		}
+		{
+			float xp = x0 + ((float)pos / dur) * ww;
+			if (xp >= x0 && xp <= x1)
+				ImDrawList_AddLine(
+				    dl, (ImVec2){xp, o.y},
+				    (ImVec2){xp, o.y + H},
+				    IM_COL32(255, 255, 255, 180), 1.0f);
+		}
+		ImDrawList_PopClipRect(dl);
+
+		igSetCursorScreenPos(
+		    (ImVec2){o.x + pad, o.y + (H - btn) * 0.5f});
+		const char *blab =
+		    removed ? i_music "##rm" : i_vpu_icon_delete_sub "##rm";
+		if (igButton(blab, (ImVec2){btn, btn}))
+			audio_removed[i] = !audio_removed[i];
+		tooltip(removed ? "Restore this audio track"
+				: "Remove this audio track");
+
+		igSetCursorScreenPos(
+		    (ImVec2){o.x + pad + btn + 8,
+			     o.y + (H - igGetTextLineHeight()) * 0.5f});
+		const char *lang = audio_tracks[i].lang[0]
+				       ? audio_tracks[i].lang
+				       : "und";
+		if (removed)
+			igText("%s #%d", lang, audio_tracks[i].index);
+		else if (state == 0)
+			igText("%s #%d \xE2\x80\xA6", lang,
+			       audio_tracks[i].index);
+		else
+			igText("%s #%d", lang, audio_tracks[i].index);
+
+		igSetCursorScreenPos((ImVec2){x0, o.y});
+		if (igInvisibleButton("wave", (ImVec2){ww, H}, 0) && !removed)
+			vp_engine_set_audio_track(vp->eng,
+						  audio_tracks[i].index);
+
+		igSetCursorScreenPos(o);
+		igDummy((ImVec2){width, H});
+		igPopID();
+	}
+	igEndChild();
+	igPopStyleVar(2);
+}
+
 void handle_crop(void *ud)
 {
 	(void)ud;
@@ -1048,15 +1428,28 @@ void render_single_click_items(ImVec2 size)
 			   &tl_drag, &tl_scrub);
 	if (vp) {
 		static int tl_was_dragging = 0;
+		static double tl_last_seek_t = -1.0;
+		static float tl_last_sent = -1.0f;
 		if (tl_drag && !tl_was_dragging) {
 			if (vp_engine_is_playing(vp->eng))
 				vp_engine_pause(vp->eng);
 			vp_engine_scrub_begin(vp->eng);
+			tl_last_seek_t = -1.0;
+			tl_last_sent = -1.0f;
 		}
 		if (tl_drag) {
-			vp_engine_seek(vp->eng, tl_scrub, false);
+			double now = glfwGetTime();
+			if (tl_scrub != tl_last_sent &&
+			    (tl_last_seek_t < 0.0 ||
+			     now - tl_last_seek_t >= 0.04)) {
+				vp_engine_seek(vp->eng, tl_scrub, false);
+				tl_last_sent = tl_scrub;
+				tl_last_seek_t = now;
+			}
 		}
 		if (!tl_drag && tl_was_dragging) {
+			if (tl_last_sent >= 0.0f)
+				vp_engine_seek(vp->eng, tl_last_sent, true);
 			vp_engine_scrub_end(vp->eng);
 		}
 		tl_was_dragging = tl_drag;
@@ -1064,17 +1457,8 @@ void render_single_click_items(ImVec2 size)
 #if 1
 	igBeginGroup();
 	{
-		if (igBeginListBox("##list_video_info", (ImVec2){-1, 100})) {
-			for (int i = 0; i < audio_track_count; i++) {
-				snprintf(tmp_buffer, sizeof(tmp_buffer),"%s %s", i_music,audio_tracks[i].lang);
-				igPushID_Int(i);
-				if(igSelectable_Bool(tmp_buffer, true, 0,(ImVec2){0, 0})){
-					vp_engine_set_audio_track(vp->eng,audio_tracks[i].index);
-				}
-				igPopID();
-			}
-			igEndListBox();
-		}
+		AudioTracksTimeline(igGetContentRegionAvail().x, trim_start,
+				    trim_end, tl_dur);
 	}
 	render_tools();
 	igEndGroup();
@@ -1215,6 +1599,14 @@ void render_single_click_items(ImVec2 size)
 				add_subtitle_lang);
 			req.remove_sub_enabled = remove_sub_enabled;
 			req.remove_sub_index = remove_sub_index;
+			req.n_drop_audio = 0;
+			for (int i = 0; i < audio_track_count &&
+					req.n_drop_audio < 16;
+			     i++)
+				if (audio_removed[i])
+					req.drop_audio_index
+					    [req.n_drop_audio++] =
+					    audio_tracks[i].index;
 			export_start(current_video_path, out_dir, &req);
 		} else {
 			error_title = "No video";
@@ -1324,6 +1716,8 @@ void refresh_video_info(void)
 	src_duration = mi.duration;
 	has_audio_src = mi.has_audio;
 	audio_track_count = vp_engine_audio_tracks(vp->eng, audio_tracks, 32);
+	aw_begin(current_video_path, audio_tracks, audio_track_count);
+	ts_begin(current_video_path);
 	if (src_width > 0 && src_height > 0) {
 		ImVec2 ratio =
 		    get_aspect_ratio((ImVec2){src_width, src_height});
@@ -1351,6 +1745,9 @@ void reset_edit_state(void)
 	ve_copy(add_subtitle_lang, sizeof(add_subtitle_lang), "und");
 	remove_sub_enabled = 0;
 	remove_sub_index = 0;
+	memset(audio_removed, 0, sizeof(audio_removed));
+	wave_tex_reset();
+	ts_tex_reset();
 	preview_dirty = 1;
 	app_reset_seq++; /* tells render_single_click_items to reset its statics
 			  */

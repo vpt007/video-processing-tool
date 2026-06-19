@@ -960,15 +960,21 @@ static void* audio_thread(void* arg) {
                             if (media_end < tgt) { av_frame_unref(flt); continue; }
                         }
 
-                        /* publish clock BEFORE the (possibly blocking) write so
-                           the value reflects pts at the END of this chunk */
+                        /* Publish the clock to reflect the pts at the END of
+                           the data NOW in the ring. This must happen AFTER the
+                           write: ring_write can block until the ring drains, and
+                           if we published the end-of-chunk pts first, the clock
+                           would read ~one chunk ahead of what is actually
+                           buffered (and audible) for the whole block — making
+                           the playhead jitter and the video present ahead of the
+                           audio. */
+                        ring_write(&vp->pcm, (const float*)flt->data[0], samples);
                         if (!isnan(pts)) {
                             pthread_mutex_lock(&vp->aclock_mu);
                             vp->audio_clock_end    = pts + (double)flt->nb_samples / vp->pcm_sr;
                             vp->audio_clock_serial = pkt_serial;
                             pthread_mutex_unlock(&vp->aclock_mu);
                         }
-                        ring_write(&vp->pcm, (const float*)flt->data[0], samples);
                         av_frame_unref(flt);
                     }
                 }
@@ -1181,6 +1187,14 @@ VPEngine* vp_engine_create(const char* path, float scale) {
         if (ma_device_init(NULL, &cfg, &vp->audio_dev) == MA_SUCCESS) {
             ma_device_start(&vp->audio_dev);
             vp->audio_ok = true;
+            /* Use the REAL hardware buffer (periods x period size) as the
+               latency estimate, not a single requested period: miniaudio may
+               pick a different size, and the whole buffer is what sits between
+               the ring and the speaker. Wrong latency => steady A/V offset. */
+            ma_uint32 ps = vp->audio_dev.playback.internalPeriodSizeInFrames;
+            ma_uint32 np = vp->audio_dev.playback.internalPeriods;
+            if (ps > 0 && np > 0)
+                vp->dev_period = (int)(ps * np);
         }
     } else {
         /* dummy ring so ring_* calls are always valid */
