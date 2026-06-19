@@ -23,6 +23,8 @@ typedef struct {
 	char subtitle[VE_PATH_MAX];
 	char subtitle_lang[16];
 	int remove_sub_enabled, remove_sub_index;
+	int drop_audio_index[16];
+	int n_drop_audio;
 } ExportRequest;
 
 typedef struct {
@@ -93,6 +95,9 @@ static void export_build_script(const ExportRequest *r, char *out, int cap)
 	if (r->remove_sub_enabled)
 		n += snprintf(out + n, cap - n, "remove-subtitle %d\n",
 			      r->remove_sub_index);
+	for (int i = 0; i < r->n_drop_audio; i++)
+		n += snprintf(out + n, cap - n, "remove-audio %d\n",
+			      r->drop_audio_index[i]);
 	if (r->subtitle[0])
 		n += snprintf(out + n, cap - n, "subtitle \"%s\" %s\n",
 			      r->subtitle,
@@ -148,27 +153,17 @@ static void *export_worker(void *arg)
 
 static void export_output_path(const ExportRequest *r, char *dst, int cap)
 {
-	const char *base = strrchr(r->input, '/');
-	const char *base_w = strrchr(r->input, '\\');
-	if (base_w > base)
-		base = base_w;
-	base = base ? base + 1 : r->input;
-
-	char name[OS_PATHMAX];
-	ve_copy(name, sizeof(name), base);
-	char *dot = strrchr(name, '.');
-	const char *ext = dot ? dot : "";
+	const char *base = os_path_basename(r->input);
+	const char *ext = os_path_ext(base);
 	char stem[OS_PATHMAX];
-	ve_copy(stem, sizeof(stem), name);
-	if (dot)
-		stem[dot - name] = '\0';
-
+	ve_copy(stem, sizeof(stem), base);
+	if (ext[0])
+		stem[ext - base - 1] = '\0';
 	char folder[OS_PATHMAX];
-	if (r->cfg.af[0] == 1) { /* never */
-	}
 	os_path_dirname(folder, sizeof(folder), r->input);
-
-	snprintf(dst, cap, "%s/%s_edited%s", folder, stem, ext);
+	char fname[OS_PATHMAX];
+	snprintf(fname, sizeof(fname), "%s_Processed%s", stem, ext[0] ? ext - 1 : "");
+	os_path_join(dst, cap, folder, fname);
 }
 
 void export_start(const char *input_path, const char *output_dir,
@@ -183,30 +178,23 @@ void export_start(const char *input_path, const char *output_dir,
 	memset(&g_export, 0, sizeof(g_export));
 	g_export.req = *src;
 	ve_copy(g_export.req.input, sizeof(g_export.req.input), input_path);
-
 	if (output_dir && output_dir[0]) {
-		const char *base = strrchr(input_path, '/');
-		const char *base_w = strrchr(input_path, '\\');
-		if (base_w > base)
-			base = base_w;
-		base = base ? base + 1 : input_path;
-		char name[OS_PATHMAX];
-		ve_copy(name, sizeof(name), base);
-		char *dot = strrchr(name, '.');
-		const char *ext = dot ? dot : "";
+		const char *base = os_path_basename(input_path);
+		const char *ext = os_path_ext(base);
 		char stem[OS_PATHMAX];
-		ve_copy(stem, sizeof(stem), name);
-		if (dot)
-			stem[dot - name] = '\0';
+		ve_copy(stem, sizeof(stem), base);
+		if (ext[0])
+			stem[ext - base - 1] = '\0';
 		stem[OS_PATHMAX - 64] = '\0';
-		snprintf(g_export.req.output, sizeof(g_export.req.output),
-			 "%s/%s_Processed%s", output_dir, stem, ext);
+		char fname[OS_PATHMAX];
+		snprintf(fname, sizeof(fname), "%s_Processed%s", stem, ext[0] ? ext - 1 : "");
+		os_path_join(g_export.req.output, sizeof(g_export.req.output),
+			 output_dir, fname);
 	} else {
 		export_output_path(&g_export.req, g_export.req.output,
 				   sizeof(g_export.req.output));
 	}
 	ve_copy(g_export.output, sizeof(g_export.output), g_export.req.output);
-
 	atomic_store(&g_export.cancel, 0);
 	atomic_store(&g_export.done, 0);
 	atomic_store(&g_export.fraction, 0.0);
