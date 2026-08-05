@@ -9,8 +9,13 @@
 #define GLAD_GL_IMPLEMENTATION
 #include "gl.h"
 #include <GLFW/glfw3.h>
-#ifdef _MSC_VER
+
+
+#if defined(_WIN32)
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>
 #include <windows.h>
+#include <dwmapi.h>
 #endif
 
 #define _CRT_SECURE_NO_WARNINGS
@@ -1943,7 +1948,19 @@ int main(int argc, char *argv[])
 		glfwTerminate();
 		return -1;
 	}
-	
+
+#if defined(_WIN32) && defined(DWMWA_USE_IMMERSIVE_DARK_MODE)
+    BOOL dark = TRUE;
+    DwmSetWindowAttribute(
+        glfwGetWin32Window(window),
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
+        &dark,
+        sizeof(dark)
+    );
+#endif
+
+
+
 	glfwSetWindowSizeLimits(window, WIDTH * 16, HEIGHT * 9,GLFW_DONT_CARE, GLFW_DONT_CARE);
 	glfwSetWindowAspectRatio(window, 16, 9);
 	glfwMakeContextCurrent(window);
@@ -2134,9 +2151,7 @@ ImFontConfig_destroy(icon_cfg);
 
 
 
-				if (igBeginTabItem(i_vpu_icon_settings
-						   " Settings",
-						   NULL, 0)) {
+				if (igBeginTabItem(i_vpu_icon_settings,NULL, 0)) {
 					igText("WIP work in progress");
 					igEndTabItem();
 				}
