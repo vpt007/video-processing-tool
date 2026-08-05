@@ -1,4 +1,5 @@
 #include <math.h>
+#include <float.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -18,6 +19,8 @@
 
 #include "vendor/tinyfiledialogs.c"
 
+
+#include "logger.h"
 #include "vp_engine.c"
 #include "config.h"
 #include "icon_moon.h"
@@ -61,6 +64,20 @@ VPWidget *vp = NULL;
 GLFWwindow *window;
 ImFont *icon_font;
 
+/* Actual on-screen rectangle of the video image inside the preview box, in
+   screen coordinates. Written by vp_render every frame; consumed by the crop
+   overlay so it can sit exactly over the image. When crop is active the frame
+   is drawn rotated in screen space: img_min/max is then the UN-rotated source
+   rect (centred in the box) and g_preview_angle is the rotation the overlay
+   must apply so its handles track the rotated image. g_preview_box_* is the
+   full preview box, used to clip the overlay. */
+ImVec2 g_preview_img_min = {0, 0};
+ImVec2 g_preview_img_max = {0, 0};
+ImVec2 g_preview_box_min = {0, 0};
+ImVec2 g_preview_box_max = {0, 0};
+float  g_preview_angle   = 0.0f;
+int    g_preview_has_img = 0;
+
 #define tool_tip_size 16
 #define small_icon_size 55
 #define big_icon_size 105
@@ -87,6 +104,11 @@ typedef struct {
 	char vf[JH_BUFFER_MAX];
 	char af[JH_BUFFER_MAX];
 } VideoConfig;
+
+/* Defined further down with the rest of the edit state, but vp_render (above
+   them) needs them for the in-preview crop overlay. */
+extern VideoConfig video_config;
+extern int crop_enabled;
 
 VPWidget *vp_create(const char *path, float scale)
 {
@@ -137,6 +159,7 @@ unsigned int vp_get_texture(VPWidget *vp, int *w, int *h)
 void vp_render(VPWidget *ctx, float w, float h)
 {
 	if(!ctx){
+		g_preview_has_img = 0;
 		igPushFont(NULL,small_icon_size-20);
 		if(igButton("Drag And Drop Here",(ImVec2){w,h})){
 
@@ -160,6 +183,8 @@ void vp_render(VPWidget *ctx, float w, float h)
 		box_h = 1;
 	ImVec2_c box_origin = igGetCursorScreenPos();
 	ImDrawList *dl = igGetWindowDrawList();
+	g_preview_box_min = (ImVec2){box_origin.x, box_origin.y};
+	g_preview_box_max = (ImVec2){box_origin.x + box_w, box_origin.y + box_h};
 	if (tex && texture_width > 0 && texture_height > 0) {
 		float tex_aspect_ratio =
 		    (float)texture_width / (float)texture_height;
@@ -177,6 +202,11 @@ void vp_render(VPWidget *ctx, float w, float h)
 		tex_ref._TexID = (ImTextureID)(uintptr_t)tex;
 		ImDrawList_AddImage(dl, tex_ref, p0, p1, (ImVec2){0, 0},
 				    (ImVec2){1, 1}, 0xFFFFFFFF);
+		g_preview_img_min = p0;
+		g_preview_img_max = p1;
+		g_preview_has_img = 1;
+	} else {
+		g_preview_has_img = 0;
 	}
 	ImVec2 border_p0 = {box_origin.x, box_origin.y};
 	ImVec2 border_p1 = {box_origin.x + box_w, box_origin.y + box_h};
@@ -262,6 +292,7 @@ float crop_t                                = 0.0f;
 float crop_r                                = 1.0f;
 float crop_b                                = 1.0f;
 
+bool should_trim                            = false;
 int preview_dirty                           = 1;
 
 int scale_enabled                           = 0;
@@ -293,12 +324,47 @@ const char *error_title                     = NULL;
 
 bool show_crop                              = false;
 
+Logger logger ;
+
 ImVec2 rotate_point(ImVec2 p, float deg)
 {
 	float r = deg * (float)M_PI / 180.0f;
 	return (ImVec2){p.x * cosf(r) - p.y * sinf(r),
 			p.x * sinf(r) + p.y * cosf(r)};
 }
+static inline void os_human_size(long long bytes, char *out, int size) {
+    const char *u[] = { "B", "KB", "MB", "GB", "TB", "PB", "EB" };
+    double n = (double)bytes;
+    int i = 0;
+
+    while (n >= 1024.0 && i < 6) {
+        n /= 1024.0;
+        i++;
+    }
+
+    if (i == 0)
+        snprintf(out, size, "%lld %s", bytes, u[i]);
+    else
+        snprintf(out, size, "%.2f %s", n, u[i]);
+}
+
+
+
+void jh_generate_log()
+{
+
+	char human_readable_size[32];
+	long long file_size = os_filesize(current_video_path);
+	os_human_size(file_size,human_readable_size,sizeof(human_readable_size));
+
+	log_info(&logger, "Input File     :%s", current_video_path);
+	log_info(&logger, "Input File Size:%s",human_readable_size);
+	log_info(&logger, "Input File:         %s",current_video_path);
+	log_info(&logger, "Input File:         %s",current_video_path);
+	log_info(&logger, "Input File:         %s",current_video_path);
+}
+
+
 // https://github.com/ocornut/imgui/wiki/Image-Loading-and-Displaying-Examples#example-for-opengl-users
 bool load_texture_from_mem(const void *data, size_t data_size,
 			   GLuint *out_texture, int *out_width, int *out_height)
@@ -328,6 +394,7 @@ bool load_texture_from_mem(const void *data, size_t data_size,
 	*out_height = image_height;
 	return true;
 }
+
 bool load_texture_from_file(const char *file_name, GLuint *out_texture,
 			    int *out_width, int *out_height)
 {
@@ -407,48 +474,12 @@ void rebuild_preview_filters(void)
 	int n = 0;
 	vf[0] = 0;
 
-	if (crop_enabled && src_width > 1 && src_height > 1) {
-		float l = crop_l, t = crop_t, r = crop_r, b = crop_b;
-		if (l < 0)
-			l = 0;
-		if (t < 0)
-			t = 0;
-		if (r > 1)
-			r = 1;
-		if (b > 1)
-			b = 1;
-		if (r - l < 0.02f)
-			r = l + 0.02f;
-		if (b - t < 0.02f)
-			b = t + 0.02f;
-		int x = (int)(l * src_width);
-		int y = (int)(t * src_height);
-		int w = (int)((r - l) * src_width) & ~1;
-		int h = (int)((b - t) * src_height) & ~1;
-		if (w < 2)
-			w = 2;
-		if (h < 2)
-			h = 2;
-		if (x < 0)
-			x = 0;
-		if (y < 0)
-			y = 0;
-		if (x + w > src_width)
-			x = src_width - w;
-		if (y + h > src_height)
-			y = src_height - h;
-		if (x < 0) {
-			x = 0;
-			w = src_width & ~1;
-		}
-		if (y < 0) {
-			y = 0;
-			h = src_height & ~1;
-		}
-		n += snprintf(vf + n, sizeof(vf) - n, "%scrop=%d:%d:%d:%d",
-			      n ? "," : "", w, h, x, y);
-	}
-
+	/* Crop is never baked into the preview: it is an interactive overlay
+	   drawn on the displayed (rotated/flipped) frame, just like a real
+	   editor. Rotate/flip/scale stay applied so the preview reflects them
+	   while cropping. Only the aspect-ratio pad/scale is suppressed during
+	   crop, so the user crops the pre-aspect frame (export crops before it
+	   applies the aspect filter too). */
 	int rot = ((video_config.rotate % 360) + 360) % 360;
 	if (rot == 90)
 		n += snprintf(vf + n, sizeof(vf) - n, "%stranspose=1",
@@ -479,7 +510,7 @@ void rebuild_preview_filters(void)
 				      n ? "," : "", scale_w & ~1, scale_h & ~1);
 	}
 
-	if (video_config.aspect_ratio.x > 0.0f &&
+	if (!crop_enabled && video_config.aspect_ratio.x > 0.0f &&
 	    video_config.aspect_ratio.y > 0.0f)
 		n += snprintf(vf + n, sizeof(vf) - n,
 			      "%sscale=trunc(ih*%d/%d/2)*2:ih,setsar=1",
@@ -512,6 +543,49 @@ void rebuild_preview_filters(void)
 
 void set_rotation(int angle) { video_config.rotate = angle; }
 
+/* The crop overlay sits on the DISPLAYED frame (source after rotate+flip).
+   The export pipeline crops the SOURCE first (before it rotates/flips), so the
+   displayed-frame crop fractions have to be mapped back into source-frame
+   fractions. Exact for rotations that are multiples of 90 degrees; arbitrary
+   custom angles are snapped to the nearest quarter-turn for this mapping. */
+static void crop_disp_to_src(float dl, float dt, float dr, float db, int rotate,
+			     bool fh, bool fv, float *sl, float *st, float *sr,
+			     float *sb)
+{
+	int R = ((rotate % 360) + 360) % 360;
+	int q = ((R + 45) / 90) % 4; /* 0->0, 1->90, 2->180, 3->270 (CW) */
+	float cx[4] = {dl, dr, dr, dl};
+	float cy[4] = {dt, dt, db, db};
+	float mnx = 1e9f, mny = 1e9f, mxx = -1e9f, mxy = -1e9f;
+	for (int i = 0; i < 4; i++) {
+		float u = cx[i], v = cy[i];
+		/* export applies flip AFTER rotate, so undo flip first */
+		if (fh)
+			u = 1.0f - u;
+		if (fv)
+			v = 1.0f - v;
+		float su, sv;
+		switch (q) {
+		case 1: su = v;        sv = 1.0f - u; break; /* undo 90 CW  */
+		case 2: su = 1.0f - u; sv = 1.0f - v; break; /* undo 180    */
+		case 3: su = 1.0f - v; sv = u;        break; /* undo 270 CW */
+		default: su = u;       sv = v;        break; /* 0           */
+		}
+		if (su < mnx) mnx = su;
+		if (su > mxx) mxx = su;
+		if (sv < mny) mny = sv;
+		if (sv > mxy) mxy = sv;
+	}
+	if (mnx < 0.0f) mnx = 0.0f;
+	if (mny < 0.0f) mny = 0.0f;
+	if (mxx > 1.0f) mxx = 1.0f;
+	if (mxy > 1.0f) mxy = 1.0f;
+	*sl = mnx;
+	*st = mny;
+	*sr = mxx;
+	*sb = mxy;
+}
+
 typedef struct {
 	char *label;
 	char *tooltip;
@@ -537,7 +611,11 @@ typedef struct {
 bool jh_chk_button(const char *label, bool *status, ImVec2 size)
 {
 	if (*status) {
-		igPushStyleColor_Vec4(ImGuiCol_Button,JRGB(22.0f,222.0f,53.0f));
+			if(vp)
+				igPushStyleColor_Vec4(ImGuiCol_Button,JRGB(22.0f,222.0f,53.0f));
+		else
+				igPushStyleColor_Vec4(ImGuiCol_Button, (ImVec4){0.3f, 0.3f, 0.3f, 1.0f});
+
 	}
 	bool clicked = igButton(label, size);
 	if (*status) {
@@ -610,9 +688,10 @@ void ts_tex_reset(void)
 
 #define TL_HEADER_W 132.0f
 
+
 void TimelineTrimWidget(const char *label, float *trim_start, float *trim_end,
 			float duration, ImVec2 size, int *out_dragging,
-			float *out_scrub)
+			float *out_scrub, bool show_trim)
 {
 	static int dragging = 0;
 	static float drag_offset = 0.0f;
@@ -625,8 +704,6 @@ void TimelineTrimWidget(const char *label, float *trim_start, float *trim_end,
 	float y0 = pos.y;
 	float y1 = pos.y + h;
 
-	/* Time axis lives to the right of a fixed-width header column, exactly
-	   like the audio tracks, so both share one x->time mapping. */
 	float tx0 = pos.x + TL_HEADER_W;
 	float tw = w - TL_HEADER_W;
 	if (tw < 10.0f)
@@ -634,12 +711,12 @@ void TimelineTrimWidget(const char *label, float *trim_start, float *trim_end,
 
 	float sx = tx0 + (*trim_start / duration) * tw;
 	float ex = tx0 + (*trim_end / duration) * tw;
-	float min_px = hw * 2 + 4.0f; // minimum pixel gap between handles
-	bool hit_left = mouse.x >= sx - hw && mouse.x <= sx + hw &&
+	float min_px = hw * 2 + 4.0f;
+	bool hit_left = show_trim && mouse.x >= sx - hw && mouse.x <= sx + hw &&
 			mouse.y >= y0 && mouse.y <= y1;
-	bool hit_right = mouse.x >= ex - hw && mouse.x <= ex + hw &&
+	bool hit_right = show_trim && mouse.x >= ex - hw && mouse.x <= ex + hw &&
 			 mouse.y >= y0 && mouse.y <= y1;
-	bool hit_body = !hit_left && !hit_right && mouse.x > sx + hw &&
+	bool hit_body = show_trim && !hit_left && !hit_right && mouse.x > sx + hw &&
 			mouse.x < ex - hw && mouse.y >= y0 && mouse.y <= y1;
 	igSetCursorScreenPos(pos);
 	igSetNextItemAllowOverlap();
@@ -694,13 +771,9 @@ void TimelineTrimWidget(const char *label, float *trim_start, float *trim_end,
 	ImDrawList_PushClipRect(dl, (ImVec2){pos.x, y0},
 				(ImVec2){pos.x + w, y1}, true);
 
-	/* left header column (matches the audio track chips) */
 	ImDrawList_AddRectFilled(dl, (ImVec2){pos.x, y0}, (ImVec2){tx0, y1},
 				 IM_COL32(18, 18, 22, 255), 0, 0);
 
-	/* base layer: filmstrip thumbnails, tiled edge-to-edge (cover fit, no
-	   gaps). A placeholder fill is drawn only until a cell's texture is
-	   ready, so the common path is just one textured quad per cell. */
 	int tsn = ts_count();
 	if (tsn > 0) {
 		float cellw = tw / (float)tsn;
@@ -752,36 +825,34 @@ void TimelineTrimWidget(const char *label, float *trim_start, float *trim_end,
 					 0.0f, 0);
 	}
 
-	/* dim trimmed-out regions, tint the kept selection translucently so the
-	   thumbnails still read through it */
-	ImDrawList_AddRectFilled(dl, (ImVec2){tx0, y0}, (ImVec2){sx, y1},
-				 IM_COL32(0, 0, 0, 150), 0, 0);
-	ImDrawList_AddRectFilled(dl, (ImVec2){ex, y0}, (ImVec2){tx0 + tw, y1},
-				 IM_COL32(0, 0, 0, 150), 0, 0);
-	ImDrawList_AddRectFilled(dl, (ImVec2){sx, y0}, (ImVec2){ex, y1},
-				 IM_COL32(34, 136, 255, 64), 0, 0);
-	ImDrawList_AddRect(dl, (ImVec2){sx, y0}, (ImVec2){ex, y1},
-			   IM_COL32(34, 136, 255, 255), 0.0f, 2.0f, 0);
-	ImDrawList_AddRectFilled(dl, (ImVec2){sx - hw, y0},
-				 (ImVec2){sx + hw, y1}, 0xFFCCCCCC, 4.0f, 0);
-	ImDrawList_AddRect(dl, (ImVec2){sx - hw, y0}, (ImVec2){sx + hw, y1},
-			   0xFF000000, 4.0f, 1.5f, 0);
-	for (int i = 0; i < 3; i++)
-		ImDrawList_AddCircleFilled(
-		    dl, (ImVec2){sx, y0 + h * 0.5f + (i - 1) * 5.0f}, 2.0f,
-		    0xFF333333, 8);
-	ImDrawList_AddRectFilled(dl, (ImVec2){ex - hw, y0},
-				 (ImVec2){ex + hw, y1}, 0xFFCCCCCC, 4.0f, 0);
-	ImDrawList_AddRect(dl, (ImVec2){ex - hw, y0}, (ImVec2){ex + hw, y1},
-			   0xFF000000, 4.0f, 1.5f, 0);
-	for (int i = 0; i < 3; i++)
-		ImDrawList_AddCircleFilled(
-		    dl, (ImVec2){ex, y0 + h * 0.5f + (i - 1) * 5.0f}, 2.0f,
-		    0xFF333333, 8);
+	if (show_trim) {
+		ImDrawList_AddRectFilled(dl, (ImVec2){tx0, y0}, (ImVec2){sx, y1},
+					 IM_COL32(0, 0, 0, 150), 0, 0);
+		ImDrawList_AddRectFilled(dl, (ImVec2){ex, y0}, (ImVec2){tx0 + tw, y1},
+					 IM_COL32(0, 0, 0, 150), 0, 0);
+		ImDrawList_AddRectFilled(dl, (ImVec2){sx, y0}, (ImVec2){ex, y1},
+					 IM_COL32(34, 136, 255, 64), 0, 0);
+		ImDrawList_AddRect(dl, (ImVec2){sx, y0}, (ImVec2){ex, y1},
+				   IM_COL32(34, 136, 255, 255), 0.0f, 2.0f, 0);
+		ImDrawList_AddRectFilled(dl, (ImVec2){sx - hw, y0},
+					 (ImVec2){sx + hw, y1}, 0xFFCCCCCC, 4.0f, 0);
+		ImDrawList_AddRect(dl, (ImVec2){sx - hw, y0}, (ImVec2){sx + hw, y1},
+				   0xFF000000, 4.0f, 1.5f, 0);
+		for (int i = 0; i < 3; i++)
+			ImDrawList_AddCircleFilled(
+			    dl, (ImVec2){sx, y0 + h * 0.5f + (i - 1) * 5.0f}, 2.0f,
+			    0xFF333333, 8);
+		ImDrawList_AddRectFilled(dl, (ImVec2){ex - hw, y0},
+					 (ImVec2){ex + hw, y1}, 0xFFCCCCCC, 4.0f, 0);
+		ImDrawList_AddRect(dl, (ImVec2){ex - hw, y0}, (ImVec2){ex + hw, y1},
+				   0xFF000000, 4.0f, 1.5f, 0);
+		for (int i = 0; i < 3; i++)
+			ImDrawList_AddCircleFilled(
+			    dl, (ImVec2){ex, y0 + h * 0.5f + (i - 1) * 5.0f}, 2.0f,
+			    0xFF333333, 8);
+	}
 	ImDrawList_PopClipRect(dl);
 
-	/* header label; restore the layout cursor so downstream items are
-	   unaffected by our manual positioning */
 	igSetCursorScreenPos((ImVec2){pos.x + 8.0f,
 				      y0 + (h - igGetTextLineHeight()) * 0.5f});
 	igText("%s Video", i_vpu_icon_thumbnail);
@@ -792,7 +863,7 @@ void TimelineTrimWidget(const char *label, float *trim_start, float *trim_end,
 	if (out_scrub)
 		*out_scrub = (dragging == 2) ? *trim_end : *trim_start;
 }
-/* #include "test.c" */
+#include "test.c"
 #include "ve_export.c"
 #include "audio_wave.c"
 
@@ -1018,7 +1089,6 @@ static void AudioTracksTimeline(float width, float trim_start, float trim_end,
 			       audio_tracks[i].index);
 		else
 			igText("%s #%d", lang, audio_tracks[i].index);
-
 		igSetCursorScreenPos((ImVec2){x0, o.y});
 		if (igInvisibleButton("wave", (ImVec2){ww, H}, 0) && !removed)
 			vp_engine_set_audio_track(vp->eng,
@@ -1026,17 +1096,17 @@ static void AudioTracksTimeline(float width, float trim_start, float trim_end,
 
 		igSetCursorScreenPos(o);
 		igDummy((ImVec2){width, H});
+
+		/* if(video_config.mute){ */
+		/* 	audio_removed[i] = true; */
+		/* } */
+
 		igPopID();
 	}
 	igEndChild();
 	igPopStyleVar(2);
 }
 
-void handle_crop(void *ud)
-{
-	(void)ud;
-	crop_enabled = !crop_enabled;
-}
 void handle_add_thumbnail(void *ud)
 {
 	(void)ud;
@@ -1095,29 +1165,67 @@ void render_remove_sub_popup(void)
 void render_tools()
 {
 	igBeginGroup();
-	static BtnItem items[] = {
-	    {i_vpu_icon_thumbnail, "Add a cover thumbnail",handle_add_thumbnail},
-	    {i_vpu_icon_crop, "Toggle crop", handle_crop},
-	    {i_vpu_icon_trim, "Trim using the timeline below",handle_trim_noop},
-	    {i_vpu_icon_add_subs, "Add a subtitle track", handle_add_subtitle},
-	    {i_vpu_icon_delete_sub, "Remove a subtitle track",handle_remove_subtitle},
-	};
-	int n = ARR_LEN(items);
-	ImVec2 btn_size = {64,64};
+	int n = 7; // total items 
+	ImVec2 btn_size = {145,145};
 	float total_btn = btn_size.x * n;
-	float spacing = (igGetContentRegionAvail().x - total_btn) / (n - 1);
-	igPushStyleVar_Vec2(ImGuiStyleVar_ItemSpacing, (ImVec2){spacing, 0});
-	for (int i = 0; i < n; i++) {
-		igPushFont(icon_font, 32);
-		if (igButton(items[i].label, btn_size))
-			items[i].on_click(NULL);
-		igPopFont();
-		tooltip(items[i].tooltip);
-		if (i < (n - 1))
-			igSameLine(0.0f, -1.0f);
-	}
+	// float spacing = (igGetContentRegionAvail().x - total_btn) / (n - 1);
+	// igPushStyleVar_Vec2(ImGuiStyleVar_ItemSpacing, (ImVec2){spacing, 0});
+	igPushStyleVar_Vec2(ImGuiStyleVar_ItemSpacing, (ImVec2){10, 0});
+		const int icon_size = big_icon_size;
+	igPushFont(icon_font, icon_size);
+	if (igButton(i_vpu_icon_thumbnail, btn_size))
+		handle_add_thumbnail(NULL);
+	igPopFont();
+	tooltip("Add a cover thumbnail");
+	igSameLine(0.0f, -1.0f);
+
+
+	igPushFont(icon_font, icon_size);
+	if (igButton(i_VPU_Icon_Vector_Remove_Thumbnail_2, btn_size))
+		handle_add_thumbnail(NULL);
+	igPopFont();
+	tooltip("Remove Thumbnail");
+	igSameLine(0.0f, -1.0f);
+
+
+	igPushFont(icon_font, icon_size);
+	if (igButton(i_VPU_Icon_Vector_Select_Frame_as_Thumbnail, btn_size))
+		handle_add_thumbnail(NULL);
+	igPopFont();
+	tooltip("This frame as thumbnail");
+	igSameLine(0.0f, -1.0f);
+
+
+
+	igPushFont(icon_font, icon_size);
+	jh_chk_button(i_vpu_icon_crop,&crop_enabled,btn_size);
+	igPopFont();
+	tooltip("Toogle Crop");
+	igSameLine(0.0f, -1.0f);
+
+	igPushFont(icon_font, icon_size);
+	jh_chk_button(i_vpu_icon_trim,&should_trim,btn_size);
+	igPopFont();
+	tooltip("Toogle Trim");
+	igSameLine(0.0f, -1.0f);
+
+	igPushFont(icon_font, icon_size);
+	if (igButton(i_vpu_icon_add_subs, btn_size))
+		handle_add_subtitle(NULL);
+	igPopFont();
+	tooltip("Add subtitle");
+	igSameLine(0.0f, -1.0f);
+
+	igPushFont(icon_font, icon_size);
+	if (igButton(i_vpu_icon_delete_sub, btn_size))
+		handle_remove_subtitle(NULL);
+	igPopFont();
+	tooltip("Add subtitle");
+
+
 	igPopStyleVar(1);
 	igEndGroup();
+
 	render_remove_sub_popup();
 	if (add_thumbnail_path[0] || add_subtitle_path[0] ||
 	    remove_sub_enabled) {
@@ -1148,6 +1256,7 @@ void render_tools()
 		}
 	}
 }
+
 void render_single_click_items(ImVec2 size)
 {
 	VideoConfig cfg_before = video_config;
@@ -1290,8 +1399,7 @@ void render_single_click_items(ImVec2 size)
 		break;
 	}
 	static ChkBtnItem items4[] = {
-	    {i_vpu_icon_volume_mute, &video_config.mute, "Strip all audio",
-	     NULL},
+	    {i_vpu_icon_volume_mute, &video_config.mute, "Strip all audio",NULL},
 	    {i_vpu_icon_stero2mono, &video_config.sterio_to_mono,
 	     "Downmix stereo to mono", NULL},
 	};
@@ -1367,25 +1475,6 @@ void render_single_click_items(ImVec2 size)
 		}
 	}
 	igSpacing();
-	/* igCheckbox("Crop", (bool *)&crop_enabled); */
-	/* tooltip("Crop the frame to a sub-rectangle"); */
-	if (crop_enabled) {
-		igSetNextItemWidth(-1);
-		igSliderFloat("##crop_l", &crop_l, 0.0f, 0.98f, "left %.2f", 0);
-		igSetNextItemWidth(-1);
-		igSliderFloat("##crop_t", &crop_t, 0.0f, 0.98f, "top %.2f", 0);
-		igSetNextItemWidth(-1);
-		igSliderFloat("##crop_r", &crop_r, 0.02f, 1.0f, "right %.2f",
-			      0);
-		igSetNextItemWidth(-1);
-		igSliderFloat("##crop_b", &crop_b, 0.02f, 1.0f, "bottom %.2f",
-			      0);
-		if (crop_r < crop_l + 0.02f)
-			crop_r = crop_l + 0.02f;
-		if (crop_b < crop_t + 0.02f)
-			crop_b = crop_t + 0.02f;
-	}
-	igSpacing();
 #if 0
 	igCheckbox("Scale", (bool *)&scale_enabled);
 	tooltip("Resize the video to a target resolution");
@@ -1425,7 +1514,7 @@ void render_single_click_items(ImVec2 size)
 	float tl_scrub = 0.0f;
 	TimelineTrimWidget("##tl", &trim_start, &trim_end, tl_dur,
 			   (ImVec2){igGetContentRegionAvail().x, 50.0f},
-			   &tl_drag, &tl_scrub);
+			   &tl_drag, &tl_scrub,should_trim);
 	if (vp) {
 		static int tl_was_dragging = 0;
 		static double tl_last_seek_t = -1.0;
@@ -1457,19 +1546,29 @@ void render_single_click_items(ImVec2 size)
 #if 1
 	igBeginGroup();
 	{
-		AudioTracksTimeline(igGetContentRegionAvail().x, trim_start,
-				    trim_end, tl_dur);
+		const float width = igGetContentRegionAvail().x;
+
+	igBeginDisabled(video_config.mute);	
+		if(should_trim)
+			AudioTracksTimeline(width, trim_start,trim_end, tl_dur);
+		else
+			AudioTracksTimeline(width, 0.0f,tl_dur, tl_dur);
 	}
+	igEndDisabled();
+
+	memset(audio_removed,video_config.mute,sizeof(audio_removed));
 	render_tools();
 	igEndGroup();
 #endif
 	igBeginGroup();
 	static char out_folder_name[OS_PATHMAX];
 	static bool out_same_as_input = true;
-	igCheckbox("Output folder same as input folder", &out_same_as_input);
+	// igCheckbox("Output folder same as input folder", &out_same_as_input);
 	btn_size.y = 0;
 	btn_size.x = 200;
-	igSetNextItemWidth(igGetContentRegionAvail().x - btn_size.x - spacing);
+	jh_chk_button("Quick Save", &out_same_as_input, (ImVec2){0,0});
+	igSameLine(0.0f, -1.0f);
+	igSetNextItemWidth(igGetContentRegionAvail().x - btn_size.x - spacing-200);
 	igBeginDisabled(out_same_as_input);
 	igInputTextWithHint("##input_out_folder", "Output Folder",
 			    out_folder_name, sizeof(out_folder_name), 0, NULL,
@@ -1484,8 +1583,11 @@ void render_single_click_items(ImVec2 size)
 			out_folder_name[sizeof(out_folder_name) - 1] = '\0';
 		}
 	}
+	if(vp && out_same_as_input){
+				os_path_dirname(out_folder_name,sizeof(out_folder_name),current_video_path);
+	}
 	igEndDisabled();
-	igEndGroup();
+	igSameLine(0.0f, -1.0f);
 	/* Apply preview filters only when the user is NOT mid-interaction.
 	   Dragging a crop/scale slider changes values every frame; rebuilding
 	   the filtergraph and re-seeking on every one of those frames floods
@@ -1497,7 +1599,6 @@ void render_single_click_items(ImVec2 size)
 	if (do_reset)
 		applied_init = 0;
 	static int applied_crop_en = 0;
-	static float a_cl = 0, a_ct = 0, a_cr = 1, a_cb = 1;
 	static int a_sc_en = 0, a_sc_w = 0, a_sc_h = 0, a_sc_ka = 1;
 	(void)cfg_before;
 	(void)crop_before;
@@ -1508,10 +1609,6 @@ void render_single_click_items(ImVec2 size)
 	if (!applied_init) {
 		applied_cfg = video_config;
 		applied_crop_en = crop_enabled;
-		a_cl = crop_l;
-		a_ct = crop_t;
-		a_cr = crop_r;
-		a_cb = crop_b;
 		a_sc_en = scale_enabled;
 		a_sc_w = scale_w;
 		a_sc_h = scale_h;
@@ -1520,18 +1617,13 @@ void render_single_click_items(ImVec2 size)
 	}
 	int changed =
 	    memcmp(&applied_cfg, &video_config, sizeof(VideoConfig)) != 0 ||
-	    applied_crop_en != crop_enabled || a_cl != crop_l ||
-	    a_ct != crop_t || a_cr != crop_r || a_cb != crop_b ||
+	    applied_crop_en != crop_enabled ||
 	    a_sc_en != scale_enabled || a_sc_w != scale_w ||
 	    a_sc_h != scale_h || a_sc_ka != scale_keep_aspect;
 	if ((changed && !igIsAnyItemActive()) || preview_dirty) {
 		preview_dirty = 0;
 		applied_cfg = video_config;
 		applied_crop_en = crop_enabled;
-		a_cl = crop_l;
-		a_ct = crop_t;
-		a_cr = crop_r;
-		a_cb = crop_b;
 		a_sc_en = scale_enabled;
 		a_sc_w = scale_w;
 		a_sc_h = scale_h;
@@ -1542,9 +1634,10 @@ void render_single_click_items(ImVec2 size)
 	export_poll();
 	/* igSetCursorPosY(igGetWindowHeight() - 50 - */
 	/* 		igGetStyle()->WindowPadding.y); */
+
+    static double pre_f = 0.0;
 	if (export_active()) {
 		double f = export_fraction();
-		static double pre_f = 0.0;
 		if (f < pre_f) f = pre_f;
 		else pre_f = f;
 		char ov[32];
@@ -1558,34 +1651,39 @@ void render_single_click_items(ImVec2 size)
 		float bar_w = igGetContentRegionAvail().x - cancel_w - spacing;
 		if (bar_w < 50.0f)
 			bar_w = 50.0f;
-		igProgressBar((float)f, (ImVec2){bar_w, 50}, ov);
+		igProgressBar((float)f, (ImVec2){bar_w,0}, ov);
 		igSameLine(0.0f, spacing);
-		if (igButton("Cancel", (ImVec2){cancel_w, 50}))
+		//cancle button
+		if (igButton("X", (ImVec2){cancel_w, 0}))
 			export_request_cancel();
-	} else if (igButton("Render", (ImVec2){-1, 50})) {
+	} else if (igButton("Render", (ImVec2){-FLT_MIN, 0})) {
 		if (current_video_path[0]) {
+				pre_f = 0.0f;
 			float dur =
 			    vp ? (float)vp_engine_duration(vp->eng) : 0.0f;
 			float te = (trim_end > 0.0f) ? trim_end : dur;
 			int has_trim = (trim_start > 0.0f) ||
 				       (trim_end > 0.0f && trim_end < dur);
-			const char *out_dir =
-			    out_same_as_input ? NULL : out_folder_name;
+			const char *out_dir = out_folder_name;
 			ExportRequest req;
 			memset(&req, 0, sizeof(req));
 			req.cfg = video_config;
 			req.trim_start = trim_start;
 			req.trim_end = te;
 			req.duration = dur;
-			req.has_trim = has_trim;
+			req.has_trim = has_trim && should_trim;
 			req.crop_enabled = crop_enabled;
 			if (crop_enabled && src_width > 0 && src_height > 0) {
-				req.crop_x = (int)(crop_l * src_width);
-				req.crop_y = (int)(crop_t * src_height);
-				req.crop_w =
-				    (int)((crop_r - crop_l) * src_width) & ~1;
-				req.crop_h =
-				    (int)((crop_b - crop_t) * src_height) & ~1;
+				float sl, st, sr, sb;
+				crop_disp_to_src(crop_l, crop_t, crop_r, crop_b,
+						 video_config.rotate,
+						 video_config.flip_h,
+						 video_config.flip_v, &sl, &st,
+						 &sr, &sb);
+				req.crop_x = (int)(sl * src_width);
+				req.crop_y = (int)(st * src_height);
+				req.crop_w = (int)((sr - sl) * src_width) & ~1;
+				req.crop_h = (int)((sb - st) * src_height) & ~1;
 			}
 			req.scale_enabled = scale_enabled;
 			req.scale_w = scale_w;
@@ -1607,12 +1705,15 @@ void render_single_click_items(ImVec2 size)
 					req.drop_audio_index
 					    [req.n_drop_audio++] =
 					    audio_tracks[i].index;
+			jh_generate_log();
 			export_start(current_video_path, out_dir, &req);
 		} else {
 			error_title = "No video";
 			error_message = "Load a video before rendering.";
 		}
 	}
+		
+	igEndGroup();
 }
 typedef enum { IMAGE, VIDEO, UNKNOWN } FileType;
 FileType check_file_type(const char *path)
@@ -1797,6 +1898,22 @@ void drop_callback(GLFWwindow *window, int count, const char **paths)
 cleanup:
 	error_message = "File not supported";
 }
+
+
+void handle_shortcut()
+{
+		if (igIsKeyPressed_Bool(ImGuiKey_P, false) || igIsKeyPressed_Bool(ImGuiKey_Space, false)) {
+				if(vp_engine_is_playing(vp->eng)){
+						vp_engine_pause(vp->eng);
+				}
+				else{
+						vp_engine_play(vp->eng);
+				}
+		}else if(igIsKeyPressed_Bool(ImGuiKey_M, false)){
+				video_config.mute = !video_config.mute;
+		}
+}
+
 int main(int argc, char *argv[])
 {
 	if (!glfwInit())
@@ -1831,6 +1948,27 @@ int main(int argc, char *argv[])
 	glfwSetWindowAspectRatio(window, 16, 9);
 	glfwMakeContextCurrent(window);
 	gladLoadGL(glfwGetProcAddress);
+
+
+
+GLFWimage icon[1];
+#include "app_icon.h"
+icon[0].pixels = stbi_load_from_memory(asset_AppIcon_5_png,asset_AppIcon_5_png_len,&icon[0].width, &icon[0].height, NULL, 4);
+
+if (icon[0].pixels)
+{
+    glfwSetWindowIcon(window, 1, icon);
+    stbi_image_free(icon[0].pixels);
+}
+
+
+
+
+
+
+
+
+
 	// enable vsync
 	glfwSwapInterval(1);
 	// check opengl version sdl uses
@@ -1870,7 +2008,7 @@ int main(int argc, char *argv[])
 	/* ImFontConfig_destroy(icon_cfg); */
 
 
-
+logger_init(&logger,"vpt_log.txt");
 const float ui_font_size   = 16.0f;
 const float icon_font_size = ui_font_size * 0.75f;  /* relative; tune 0.7–0.8 */
 
@@ -1908,7 +2046,7 @@ ImFontConfig_destroy(icon_cfg);
 	style->WindowRounding = 0.0f;
 	style->FrameRounding = 10.0f;
 	style->GrabRounding = 10.0f;
-	style->TabRounding = 10.0f;
+	style->TabRounding = 5.0f;
 
 
 	while (!glfwWindowShouldClose(window)) {
@@ -1917,6 +2055,10 @@ ImFontConfig_destroy(icon_cfg);
 		ImGui_ImplOpenGL3_NewFrame();
 		ImGui_ImplGlfw_NewFrame();
 		igNewFrame();
+		if(vp && !ioptr->WantTextInput)
+				handle_shortcut();
+
+
 		ImGuiViewport *viewport = igGetMainViewport();
 		igSetNextWindowPos(viewport->Pos, ImGuiCond_Always,
 				   (ImVec2){0, 0});
@@ -1949,29 +2091,58 @@ ImFontConfig_destroy(icon_cfg);
 					igBeginDisabled(!vp);
 					render_single_click_items((ImVec2){w, 0});
 					igEndDisabled();
+					/* Crop overlay LAST: it draws via the
+					   window draw list and positions its
+					   handles with absolute screen coords, so
+					   keeping it out of the two-column flow
+					   above stops it from dragging the panel's
+					   bottom section up over the player. */
+					if (crop_enabled && g_preview_has_img) {
+						ImVec2 save =
+						    igGetCursorScreenPos();
+						crop_widget(
+						    g_preview_img_min,
+						    (ImVec2){g_preview_img_max.x -
+								 g_preview_img_min
+								     .x,
+							     g_preview_img_max.y -
+								 g_preview_img_min
+								     .y},
+						    g_preview_angle,
+						    g_preview_box_min,
+						    g_preview_box_max, false);
+						igSetCursorScreenPos(save);
+					}
 					error_dialog_render();
 					igEndTabItem();
 				}
 
-				if (igBeginTabItem(i_vpu_icon_settings
-						   " Settings",
-						   NULL, 0)) {
-					igText("Content of Tab 3");
-					igEndTabItem();
-				}
 
 
-#if 0
-				if (igBeginTabItem("Transcode", NULL, 0)) {
+#if 1
+				if (igBeginTabItem("Convert", NULL, 0)) {
 					/* vp_render(vp, 300, 300); */
 					igEndTabItem();
 				}
-				if (igBeginTabItem("Rare", NULL, 0)) {
+
+
+
+				if (igBeginTabItem("Repair", NULL, 0)) {
 					igText("Content of Tab 2");
 					igEndTabItem();
 				}
-				if (igBeginTabItem(i_info " About", NULL, 0)) {
-					igText("Content of Tab 3");
+
+
+
+				if (igBeginTabItem(i_vpu_icon_settings
+						   " Settings",
+						   NULL, 0)) {
+					igText("WIP work in progress");
+					igEndTabItem();
+				}
+
+				if (igBeginTabItem(i_info, NULL, 0)) {
+					igText("WIP work in progress");
 					igEndTabItem();
 				}
 #endif
@@ -1991,6 +2162,7 @@ ImFontConfig_destroy(icon_cfg);
 		glfwSwapBuffers(window);
 	}
 	// clean up
+	logger_close(&logger);
 	ImGui_ImplOpenGL3_Shutdown();
 	ImGui_ImplGlfw_Shutdown();
 	igDestroyContext(NULL);
