@@ -184,10 +184,10 @@ void export_start(const char *input_path, const char *output_dir,
 		char stem[OS_PATHMAX];
 		ve_copy(stem, sizeof(stem), base);
 		if (ext[0])
-			stem[ext - base - 1] = '\0';
+			stem[ext - base] = '\0';
 		stem[OS_PATHMAX - 64] = '\0';
 		char fname[OS_PATHMAX];
-		snprintf(fname, sizeof(fname), "%s_Processed%s", stem, ext[0] ? ext - 1 : "");
+		snprintf(fname, sizeof(fname), "%s_Processed%s", stem, ext);
 		os_path_join(g_export.req.output, sizeof(g_export.req.output),
 			 output_dir, fname);
 	} else {
