@@ -161,6 +161,7 @@ unsigned int vp_get_texture(VPWidget *vp, int *w, int *h)
 	return vp_engine_texture(vp->eng, w, h);
 }
 
+char current_video_path[OS_PATHMAX]         = {0};
 void vp_render(VPWidget *ctx, float w, float h)
 {
 	if(!ctx){
@@ -266,12 +267,15 @@ void vp_render(VPWidget *ctx, float w, float h)
 
 
 	/* igSameLine(0.0f, -1.0f); */
+	igText(os_path_basename(current_video_path));
+	igPushStyleColor_Vec4(ImGuiCol_Button, (ImVec4){1.0f, 0.0f, 0.0f, 1.0f});
 	if(igButton(i_fire" Remove Video",(ImVec2){0,0})){
 		vp_destroy(ctx);
 		vp = NULL;
 		reset_edit_state();
 		/* refresh_video_info(); */
 	}
+	igPopStyleColor(1);
 	igPopID();
 }
 
@@ -280,7 +284,6 @@ void vp_render(VPWidget *ctx, float w, float h)
 
 VideoConfig video_config                    = {0};
 
-char current_video_path[OS_PATHMAX]         = {0};
 
 int src_width                               = 0;
 int src_height                              = 0;
