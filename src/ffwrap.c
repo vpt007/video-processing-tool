@@ -1,3 +1,11 @@
+/* ffwrap.c — thin wrapper around the ffmpeg / ffprobe command-line tools.
+ *
+ * Builds ffmpeg filter/argument strings from a small "command" object model
+ * (see the Cmd* structs below) and shells out to ffprobe to read media info
+ * (duration, streams, chapters, thumbnail) as JSON. This is the older
+ * subprocess-based path; the ve/ library (ve_exec.c) is the in-process
+ * replacement.
+ */
 #include "os.c"
 #include "util.c"
 #include "vector.h"
@@ -9,9 +17,12 @@
 #include <string.h>
 
 #define FFWRAP_MAX_BUFFER_SIZE (1 << 10)
+/* Flags passed to subprocess_create: search the user's PATH and don't open a
+   console window. */
 const int CMD__FLAG =
     subprocess_option_search_user_path | subprocess_option_no_window;
 
+/* The set of edit operations this wrapper knows how to express. */
 typedef enum {
 	ROTATE,
 	FLIP_H,
@@ -42,54 +53,65 @@ typedef enum {
 	ASCPECT_RATIO,
 } CommandKind;
 
+/* A growable char buffer (from vector.h). */
 typedef struct {
 	vpopulate(char);
 } String;
 
+/* A growable array of heap-allocated argument strings. */
 typedef struct {
 	vpopulate(char *);
 } Args;
 
+/* Base of every command: just identifies which operation it is. */
 typedef struct {
 	CommandKind kind;
 } Command;
 
+/* Rotate by `angle` degrees, optionally clockwise. */
 typedef struct {
 	Command base;
 	float angle;
 	bool clockwise;
 } CmdRotate;
 
+/* Scale the audio volume by a percentage. */
 typedef struct {
 	Command base;
 	int volume;
 } CmdScaleVolume;
 
+/* Override the display aspect ratio. */
 typedef struct {
 	Command base;
 	int x, y;
 } CmdChangeAspectRatio;
 
+/* Add an extra audio track from `src`. */
 typedef struct {
 	Command base;
 	const char *src;
 } CmdAddAudioTrack;
 
+/* Remove the audio track at `idx`. */
 typedef struct {
 	Command base;
 	int idx;
 } CmdRemoveAudioTrack;
 
+/* Add a subtitle file from `src`. */
 typedef struct {
 	Command base;
 	const char *src;
 } CmdAddSubtitle;
 
+/* Concatenate several input files. */
 typedef struct {
 	Command base;
 	char **paths;
 } CmdMerge;
 
+/* Crop to w x h at offset (x, y). */
 typedef struct {
 	Command base;
 	int x, y, w, h;
@@ -100,17 +122,20 @@ typedef struct {
 /* 	char* path; */
 /* } */
 
+/* One audio/subtitle stream as reported by ffprobe. */
 typedef struct {
 	char lang[16];
 	int index;
 } ff_track;
 
+/* One chapter (time range + title) as reported by ffprobe. */
 typedef struct {
 	double start;
 	double end;
 	char title[256];
 } ff_chapter;
 
+/* Parsed media info from ffprobe's JSON output. */
 typedef struct {
 	double duration;
 	int width;
@@ -126,6 +151,9 @@ typedef struct {
 
 
 
+/* Accumulates the pieces of an ffmpeg command line: a video filter chain
+   (vf), an audio filter chain (af), extra arguments (args), and an optional
+   filter_complex graph. */
 typedef struct {
 	String vf;
 	String af;
@@ -136,6 +164,8 @@ typedef struct {
 
 void print_command_builder(CommandBuilder *builder) {}
 
+/* Append a filter to a filter chain, inserting a ',' separator between
+   filters. */
 #define add_filter(string, src)                                                \
 	do {                                                                   \
 		if (string.count)                                              \
@@ -147,6 +177,7 @@ void print_command_builder(CommandBuilder *builder) {}
 	} while (0)
 
 // Handle error
+/* Append a heap-allocated copy of `src` to an Args vector. */
 #define add_args(string, src)                                                  \
 	do {                                                                   \
 		char *tem__v = str_duplicate((src));                           \
@@ -218,6 +249,8 @@ void visit_rotate(CmdRotate *cmd, CommandBuilder *builder)
 		break;
 	}
 	default: {
+		/* Arbitrary angles use the rotate filter (PI/180 converts
+		   degrees to radians); negative for counter-clockwise. */
 		char buffer[FFWRAP_MAX_BUFFER_SIZE];
 		if (clockwise)
 			snprintf(buffer, sizeof(buffer), "rotate=%d*PI/180",
@@ -235,6 +268,8 @@ void visit_rotate(CmdRotate *cmd, CommandBuilder *builder)
 	add_filter(builder->vf, filter);
 }
 
+/* Read an entire FILE* into a NUL-terminated heap buffer, growing it as
+   needed. Returns NULL (and *outlen = 0) on failure or empty input. */
 void *ff_slurp__stream(FILE *f, size_t *outlen)
 {
 	size_t capacity = (1 << 20);
@@ -274,6 +309,7 @@ void *ff_slurp__stream(FILE *f, size_t *outlen)
 	return data;
 }
 
+/* Free an ff_info and all of its dynamically allocated arrays. */
 void ff_info_free(ff_info *info)
 {
 	if (!info)
@@ -283,6 +319,8 @@ void ff_info_free(ff_info *info)
 	free(info->chapters);
 	free(info);
 }
+/* Parse ffprobe's JSON output into an ff_info struct. Returns NULL on parse
+   failure. The caller owns the result and must free it with ff_info_free. */
 ff_info *ff_parse_info(const char *json_str)
 {
 	cJSON *root = cJSON_Parse(json_str);
@@ -292,6 +330,7 @@ ff_info *ff_parse_info(const char *json_str)
 	ff_info *info = calloc(1, sizeof(ff_info));
 	info->thumbnail_stream_index = -1;
 
+	/* Top-level "format" object: read the total duration. */
 	cJSON *format = cJSON_GetObjectItem(root, "format");
 	if (format) {
 		cJSON *dur = cJSON_GetObjectItem(format, "duration");
@@ -299,6 +338,8 @@ ff_info *ff_parse_info(const char *json_str)
 			info->duration = atof(dur->valuestring);
 	}
 
+	/* Iterate the "streams" array, collecting audio/subtitle tracks and the
+	   video resolution / thumbnail stream. */
 	cJSON *streams = cJSON_GetObjectItem(root, "streams");
 	/* bool found_video = false; */
 	if (streams) {
@@ -315,6 +356,7 @@ ff_info *ff_parse_info(const char *json_str)
 				continue;
 
 			if (strcmp(type->valuestring, "audio") == 0) {
+				/* Append an audio track. */
 				info->audio = realloc(info->audio,
 						      (info->audio_count + 1) *
 							  sizeof(ff_track));
@@ -324,6 +366,7 @@ ff_info *ff_parse_info(const char *json_str)
 					lang ? lang->valuestring : "und",
 					sizeof(t->lang) - 1);
 			} else if (strcmp(type->valuestring, "subtitle") == 0) {
+				/* Append a subtitle track. */
 				info->subtitle = realloc(
 				    info->subtitle, (info->subtitle_count + 1) *
 							sizeof(ff_track));
@@ -334,6 +377,7 @@ ff_info *ff_parse_info(const char *json_str)
 					lang ? lang->valuestring : "und",
 					sizeof(t->lang) - 1);
 			} else if (strcmp(type->valuestring, "video") == 0) {
+				/* Record the video resolution. */
 				cJSON *w = cJSON_GetObjectItem(s, "width");
 				cJSON *h = cJSON_GetObjectItem(s, "height");
 				/* found_video = true; */
@@ -341,6 +385,8 @@ ff_info *ff_parse_info(const char *json_str)
 					info->width = w->valueint;
 				if (h)
 					info->height = h->valueint;
+				/* A stream with the "attached_pic" disposition
+				   is the embedded cover/thumbnail. */
 				cJSON *dispo =
 				    cJSON_GetObjectItem(s, "disposition");
 				if (dispo) {
@@ -354,6 +400,7 @@ ff_info *ff_parse_info(const char *json_str)
 		}
 	}
 
+	/* Parse the "chapters" array into ff_chapter entries. */
 	cJSON *chapters = cJSON_GetObjectItem(root, "chapters");
 	if (chapters) {
 		int n = cJSON_GetArraySize(chapters);
@@ -386,9 +433,12 @@ ff_info *ff_parse_info(const char *json_str)
 }
 
 
+/* Run ffprobe on `file_name` and return the parsed media info, or NULL on
+	  failure. `ffprobe` is the path to the ffprobe executable. */
 ff_info *ff_get_video_info(const char *ffprobe, const char *file_name)
 {
 
+	/* Ask ffprobe for format, streams, chapters and programs as JSON. */
 	const char *command[] = {ffprobe,
 				 "-v",
 				 "quiet",
@@ -417,8 +467,11 @@ ff_info *ff_get_video_info(const char *ffprobe, const char *file_name)
 }
 
 // TODO: handle error
+/* Extract a single frame at `sec` seconds as a BMP, returned in a heap buffer
+	  (length in *outlen). Caller frees the result. */
 void *ff_get_thumbnail(const char *ffmpeg,size_t sec,const char *file_name,size_t *outlen)
 {
+	/* Convert the seek time to an HH:MM:SS timestamp for -ss. */
 	int h = sec / 3600;
 	int m = (sec % 3600) / 60;
 	int s = sec % 60;
@@ -438,6 +491,8 @@ void *ff_get_thumbnail(const char *ffmpeg,size_t sec,const char *file_name,size_
 	return ff_slurp__stream(f, outlen);
 }
 
+/* Walk a NULL-terminated array of Command objects and accumulate the matching
+	  ffmpeg filters/args into a CommandBuilder. */
 void ff_build_cmd(Command *cmd)
 {
 	CommandBuilder builder = {0};

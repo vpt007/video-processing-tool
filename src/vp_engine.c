@@ -35,6 +35,7 @@
 #include "vp_engine.h"
 
 #include <GLFW/glfw3.h>
+#define MA_IMPLEMENTATION
 #include "miniaudio.h"
 
 #include <libavcodec/avcodec.h>
