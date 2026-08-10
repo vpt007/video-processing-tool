@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #define CIMGUI_DEFINE_ENUMS_AND_STRUCTS
+#define CIMGUI_USE_GLFW
+#define CIMGUI_USE_OPENGL3
 #include "cimgui.h"
 #include "cimgui_impl.h"
 #define GLAD_GL_IMPLEMENTATION
@@ -51,7 +53,6 @@
 	(((ImU32)(A) << 24) | ((ImU32)(B) << 16) | ((ImU32)(G) << 8) |         \
 	 ((ImU32)(R)))
 
-#define JH_BUFFER_MAX (1 << 10)
 typedef struct {
 	VPEngine *eng;
 	char ui_vf[JH_BUFFER_MAX];
@@ -97,23 +98,10 @@ int    g_preview_has_img = 0;
 /* Video Player  widget */
 
 
-typedef struct {
-	ImVec2 aspect_ratio;
-	ImVec2 scale;
-	int rotate;
-	int scale_volume;
-	bool flip_h;
-	bool flip_v;
-	bool mute;
-	bool sterio_to_mono;
-	char vf[JH_BUFFER_MAX];
-	char af[JH_BUFFER_MAX];
-} VideoConfig;
-
 /* Defined further down with the rest of the edit state, but vp_render (above
    them) needs them for the in-preview crop overlay. */
 extern VideoConfig video_config;
-extern int crop_enabled;
+extern bool crop_enabled;
 
 VPWidget *vp_create(const char *path, float scale)
 {
@@ -294,7 +282,7 @@ VPStreamInfo audio_tracks[32];
 int audio_track_count                       = 0;
 bool audio_removed[32]                      = {0};
 
-int crop_enabled                            = 0;
+bool crop_enabled                           = false;
 float crop_l                                = 0.0f;
 float crop_t                                = 0.0f;
 float crop_r                                = 1.0f;
@@ -339,6 +327,110 @@ ImVec2 rotate_point(ImVec2 p, float deg)
 	float r = deg * (float)M_PI / 180.0f;
 	return (ImVec2){p.x * cosf(r) - p.y * sinf(r),
 			p.x * sinf(r) + p.y * cosf(r)};
+}
+
+/* Interactive crop overlay. Draws a draggable crop rectangle over the preview
+   image (img_min..img_min+img_size in screen coords, rotated by `angle` deg)
+   and updates the normalized crop_l/t/r/b globals. The handles are drawn in
+   screen space; when the preview is rotated the caller passes the rotation so
+   the handles track the rotated image. */
+void crop_widget(ImVec2 img_min, ImVec2 img_size, float angle,
+		 ImVec2 box_min, ImVec2 box_max, bool active)
+{
+	(void)box_min;
+	(void)box_max;
+	(void)active;
+	ImDrawList *dl = igGetWindowDrawList();
+	ImVec2 mouse = igGetMousePos();
+
+	float w = img_size.x, h = img_size.y;
+	if (w < 1.0f || h < 1.0f)
+		return;
+
+	/* Crop rect in screen coords (unrotated). */
+	float x0 = img_min.x + crop_l * w;
+	float y0 = img_min.y + crop_t * h;
+	float x1 = img_min.x + crop_r * w;
+	float y1 = img_min.y + crop_b * h;
+
+	/* Dim the area outside the crop rect. */
+	ImDrawList_AddRectFilled(dl, img_min, (ImVec2){img_min.x + w, y0},
+				 IM_COL32(0, 0, 0, 120), 0, 0);
+	ImDrawList_AddRectFilled(dl, (ImVec2){img_min.x, y1},
+				 (ImVec2){img_min.x + w, img_min.y + h},
+				 IM_COL32(0, 0, 0, 120), 0, 0);
+	ImDrawList_AddRectFilled(dl, (ImVec2){img_min.x, y0},
+				 (ImVec2){x0, y1}, IM_COL32(0, 0, 0, 120), 0, 0);
+	ImDrawList_AddRectFilled(dl, (ImVec2){x1, y0},
+				 (ImVec2){img_min.x + w, y1},
+				 IM_COL32(0, 0, 0, 120), 0, 0);
+
+	/* Crop border. */
+	ImDrawList_AddRect(dl, (ImVec2){x0, y0}, (ImVec2){x1, y1},
+			   IM_COL32(34, 136, 255, 255), 0.0f, 2.0f, 0);
+
+	/* Handles: 4 corners then 4 edge midpoints. */
+	const float hs = 8.0f;
+	ImVec2 pts[8] = {
+	    {x0, y0}, {x1, y0}, {x1, y1}, {x0, y1},
+	    {(x0 + x1) * 0.5f, y0}, {x1, (y0 + y1) * 0.5f},
+	    {(x0 + x1) * 0.5f, y1}, {x0, (y0 + y1) * 0.5f},
+	};
+	for (int i = 0; i < 8; i++)
+		ImDrawList_AddRectFilled(dl,
+					 (ImVec2){pts[i].x - hs, pts[i].y - hs},
+					 (ImVec2){pts[i].x + hs, pts[i].y + hs},
+					 0xFFCCCCCC, 2.0f, 0);
+
+	/* Drag state: which handle (0..7) is being dragged, -1 = none. */
+	static int drag = -1;
+	if (igIsMouseClicked_Bool(0, false)) {
+		drag = -1;
+		for (int i = 0; i < 8; i++) {
+			if (fabsf(mouse.x - pts[i].x) <= hs + 2.0f &&
+			    fabsf(mouse.y - pts[i].y) <= hs + 2.0f) {
+				drag = i;
+				break;
+			}
+		}
+	}
+	if (igIsMouseReleased_Nil(0))
+		drag = -1;
+
+	if (drag >= 0 && igIsMouseDown_Nil(0)) {
+		float nx = (mouse.x - img_min.x) / w;
+		float ny = (mouse.y - img_min.y) / h;
+		nx = fmaxf(0.0f, fminf(1.0f, nx));
+		ny = fmaxf(0.0f, fminf(1.0f, ny));
+		switch (drag) {
+		case 0: crop_l = nx; crop_t = ny; break; /* TL */
+		case 1: crop_r = nx; crop_t = ny; break; /* TR */
+		case 2: crop_r = nx; crop_b = ny; break; /* BR */
+		case 3: crop_l = nx; crop_b = ny; break; /* BL */
+		case 4: crop_t = ny; break;              /* top */
+		case 5: crop_r = nx; break;              /* right */
+		case 6: crop_b = ny; break;              /* bottom */
+		case 7: crop_l = nx; break;              /* left */
+		}
+		/* Keep a minimum crop size and valid ordering. */
+		const float min_sz = 0.05f;
+		if (crop_r - crop_l < min_sz) {
+			if (drag == 1 || drag == 2 || drag == 5)
+				crop_r = crop_l + min_sz;
+			else
+				crop_l = crop_r - min_sz;
+		}
+		if (crop_b - crop_t < min_sz) {
+			if (drag == 2 || drag == 6)
+				crop_b = crop_t + min_sz;
+			else
+				crop_t = crop_b - min_sz;
+		}
+		crop_l = fmaxf(0.0f, fminf(1.0f, crop_l));
+		crop_t = fmaxf(0.0f, fminf(1.0f, crop_t));
+		crop_r = fmaxf(0.0f, fminf(1.0f, crop_r));
+		crop_b = fmaxf(0.0f, fminf(1.0f, crop_b));
+	}
 }
 static inline void os_human_size(long long bytes, char *out, int size) {
     const char *u[] = { "B", "KB", "MB", "GB", "TB", "PB", "EB" };
@@ -403,6 +495,7 @@ bool load_texture_from_mem(const void *data, size_t data_size,
 	return true;
 }
 
+/* Load an image file from disk into a GL texture (see load_texture_from_mem). */
 bool load_texture_from_file(const char *file_name, GLuint *out_texture,
 			    int *out_width, int *out_height)
 {
@@ -423,12 +516,20 @@ bool load_texture_from_file(const char *file_name, GLuint *out_texture,
 	return ret;
 }
 
+/* Render a centered modal popup showing the current error (if any). The
+   message/title are set by other parts of the app; clicking OK clears them. */
 void error_dialog_render()
 {
 	if (!error_message)
 		return;
 	if (!error_title)
 		error_title = "Error";
+	/* Log each new error once (not every frame). */
+	static const char *last_logged = NULL;
+	if (error_message != last_logged) {
+		last_logged = error_message;
+		log_error(&logger, "%s: %s", error_title, error_message);
+	}
 	igOpenPopup_Str(error_title, 0);
 	ImGuiViewport *vp = igGetMainViewport();
 	ImVec2 center = {vp->WorkPos.x + vp->WorkSize.x * 0.5f,
@@ -447,17 +548,21 @@ void error_dialog_render()
 	}
 }
 
+/* Greatest common divisor (Euclid's algorithm). */
 int gcd(int a, int b)
-{ 
-	return (b == 0) ? a : gcd(b, a % b); 
+{
+	return (b == 0) ? a : gcd(b, a % b);
 }
 
+/* Reduce a width/height pair to its lowest aspect-ratio terms. */
 ImVec2 get_aspect_ratio(ImVec2 dimension)
 {
 	int hcf = gcd(dimension.x, dimension.y);
 	return (ImVec2){dimension.x / hcf, dimension.y / hcf};
 }
 
+/* Scale `input` to fit inside a `square_size` x `square_size` box while
+   preserving its aspect ratio. */
 ImVec2 fit_image(int square_size, ImVec2 input)
 {
 	ImVec2 res = get_aspect_ratio(input);
@@ -549,6 +654,7 @@ void rebuild_preview_filters(void)
 	vp_engine_set_af(e, af[0] ? af : NULL);
 }
 
+/* Set the video rotation angle (degrees). */
 void set_rotation(int angle) { video_config.rotate = angle; }
 
 /* The crop overlay sits on the DISPLAYED frame (source after rotate+flip).
@@ -616,6 +722,8 @@ typedef struct {
 } RadioBtnItem;
 
 
+/* A toggle button bound to a bool. Highlights green while on; clicking flips
+   the value. Returns the new state. */
 bool jh_chk_button(const char *label, bool *status, ImVec2 size)
 {
 	if (*status) {
@@ -635,6 +743,8 @@ bool jh_chk_button(const char *label, bool *status, ImVec2 size)
 	return *status;
 }
 
+/* A radio-style button: selecting `id` sets *v = id; clicking the already
+   selected one clears it back to -1. Returns true when a selection changed. */
 bool jh_radio_button(const char *label, int *v, int id, ImVec2 size)
 {
 	bool is_selected = (*v == id);
@@ -664,6 +774,7 @@ static unsigned int g_ts_tex[TS_CELLS];
 static int          g_ts_tex_built[TS_CELLS];
 static int          g_ts_tex_w[TS_CELLS], g_ts_tex_h[TS_CELLS];
 
+/* Upload an RGB24 pixel buffer into a new GL texture and return its id. */
 static unsigned int ts_upload_tex(const uint8_t *rgb, int w, int h)
 {
 	if (!rgb || w <= 0 || h <= 0)
@@ -697,6 +808,10 @@ void ts_tex_reset(void)
 #define TL_HEADER_W 132.0f
 
 
+/* Interactive trim timeline widget. Draws a filmstrip (from thumb_strip.c)
+   with two draggable handles (start/end) and a movable body. Dragging modes:
+   1 = left handle, 2 = right handle, 3 = move the whole selection. Writes the
+   resulting trim times back through *trim_start / *trim_end. */
 void TimelineTrimWidget(const char *label, float *trim_start, float *trim_end,
 			float duration, ImVec2 size, int *out_dragging,
 			float *out_scrub, bool show_trim)
@@ -717,6 +832,7 @@ void TimelineTrimWidget(const char *label, float *trim_start, float *trim_end,
 	if (tw < 10.0f)
 		tw = 10.0f;
 
+	/* Convert the trim times to pixel positions on the track. */
 	float sx = tx0 + (*trim_start / duration) * tw;
 	float ex = tx0 + (*trim_end / duration) * tw;
 	float min_px = hw * 2 + 4.0f;
@@ -883,6 +999,8 @@ void TimelineTrimWidget(const char *label, float *trim_start, float *trim_end,
 #define WAVE_TEX_H 64
 static unsigned int g_wave_tex[32];
 static int          g_wave_tex_built[32];
+/* Rasterize a peak array into a bottom-anchored waveform texture (bars grow
+   upward from the bottom edge). Returns a GL texture id, or 0 on failure. */
 static unsigned int build_wave_texture(const float *pk, int npk)
 {
 	if (!pk || npk <= 0)
@@ -927,6 +1045,8 @@ static unsigned int build_wave_texture(const float *pk, int npk)
 	free(px);
 	return tex;
 }
+/* Variant that draws a vertically-centered (mirrored) waveform: bars grow
+   symmetrically up and down from the middle of the texture. */
 static unsigned int build_wave_texture1(const float *pk, int npk)
 {
 	if (!pk || npk <= 0)
@@ -986,6 +1106,9 @@ void wave_tex_reset(void)
 
 #define AUDIO_TL_MAX_VISIBLE_ROWS 3
 
+/* Draw the audio-track timeline: one row per track showing its waveform
+   (from audio_wave.c), the trim region, the playhead, and a remove/restore
+   button. Clicking a row selects that audio track for playback. */
 static void AudioTracksTimeline(float width, float trim_start, float trim_end,
 				float dur)
 {
@@ -1115,30 +1238,39 @@ static void AudioTracksTimeline(float width, float trim_start, float trim_end,
 	igPopStyleVar(2);
 }
 
+/* Open a file dialog to pick a cover thumbnail image and store its path. */
 void handle_add_thumbnail(void *ud)
 {
 	(void)ud;
 	const char *f = tinyfd_openFileDialog("Select thumbnail image", "", 0,
 					      NULL, NULL, 0);
-	if (f)
+	if (f) {
 		ve_copy(add_thumbnail_path, sizeof(add_thumbnail_path), f);
+		log_info(&logger, "Thumbnail selected: %s", f);
+	}
 }
+/* Open a file dialog to pick a subtitle file and store its path. */
 void handle_add_subtitle(void *ud)
 {
 	(void)ud;
 	const char *f =
 	    tinyfd_openFileDialog("Select subtitle file", "", 0, NULL, NULL, 0);
-	if (f)
+	if (f) {
 		ve_copy(add_subtitle_path, sizeof(add_subtitle_path), f);
+		log_info(&logger, "Subtitle selected: %s", f);
+	}
 }
 static bool open_remove_sub_popup = false;
+/* Flag that the "remove subtitle" popup should be shown next frame. */
 void handle_remove_subtitle(void *ud)
 {
 	(void)ud;
 	open_remove_sub_popup = true;
+	log_info(&logger, "Remove subtitle requested");
 }
 void handle_trim_noop(void *ud) { (void)ud; }
 
+/* Render the modal that asks which subtitle stream index to remove. */
 void render_remove_sub_popup(void)
 {
 	if (open_remove_sub_popup) {
@@ -1170,10 +1302,12 @@ void render_remove_sub_popup(void)
 	}
 }
 
+/* Render the row of big icon tool buttons (thumbnail, crop, trim, subtitle,
+   etc.) and the pending add/remove selections below them. */
 void render_tools()
 {
 	igBeginGroup();
-	int n = 7; // total items 
+	int n = 7; // total items
 	ImVec2 btn_size = {145,145};
 	float total_btn = btn_size.x * n;
 	// float spacing = (igGetContentRegionAvail().x - total_btn) / (n - 1);
@@ -1265,6 +1399,9 @@ void render_tools()
 	}
 }
 
+/* Render the single-click edit controls: rotation, flip, volume, mute/mono,
+   aspect ratio, the trim timeline, and the audio-track timeline. Applies the
+   resulting settings to the live preview engine. */
 void render_single_click_items(ImVec2 size)
 {
 	VideoConfig cfg_before = video_config;
@@ -1630,6 +1767,14 @@ void render_single_click_items(ImVec2 size)
 	    a_sc_h != scale_h || a_sc_ka != scale_keep_aspect;
 	if ((changed && !igIsAnyItemActive()) || preview_dirty) {
 		preview_dirty = 0;
+		log_info(&logger,
+			 "Edit applied: rotate=%d flip_h=%d flip_v=%d volume=%d "
+			 "mute=%d mono=%d aspect=%.0f:%.0f crop=%d",
+			 video_config.rotate, video_config.flip_h,
+			 video_config.flip_v, video_config.scale_volume,
+			 video_config.mute, video_config.sterio_to_mono,
+			 video_config.aspect_ratio.x, video_config.aspect_ratio.y,
+			 crop_enabled);
 		applied_cfg = video_config;
 		applied_crop_en = crop_enabled;
 		a_sc_en = scale_enabled;
@@ -1714,6 +1859,8 @@ void render_single_click_items(ImVec2 size)
 					    [req.n_drop_audio++] =
 					    audio_tracks[i].index;
 			jh_generate_log();
+			log_info(&logger, "Export started: %s",
+				 current_video_path);
 			export_start(current_video_path, out_dir, &req);
 		} else {
 			error_title = "No video";
@@ -1723,6 +1870,7 @@ void render_single_click_items(ImVec2 size)
 		
 	igEndGroup();
 }
+/* Classify a file as IMAGE, VIDEO, or UNKNOWN by sniffing its magic bytes. */
 typedef enum { IMAGE, VIDEO, UNKNOWN } FileType;
 FileType check_file_type(const char *path)
 {
@@ -1734,6 +1882,7 @@ FileType check_file_type(const char *path)
 	fclose(f);
 	if (n < 4)
 		return UNKNOWN;
+	/* Image signatures: JPEG, PNG, GIF, BMP, WEBP. */
 	if (b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF)
 		return IMAGE;
 	if (b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47)
@@ -1814,6 +1963,8 @@ FileType check_file_type(const char *path)
 		return VIDEO;
 	return UNKNOWN;
 }
+/* Refresh the cached media info (resolution, duration, tracks) from the
+   engine and kick off the waveform + filmstrip background workers. */
 void refresh_video_info(void)
 {
 	if (!vp)
@@ -1839,6 +1990,8 @@ void refresh_video_info(void)
 }
 
 
+/* Clear all edit state (crop, scale, trim, tracks, thumbnails) and reset the
+   UI's static widgets when a new file is loaded. */
 void reset_edit_state(void)
 {
 	video_config = (VideoConfig){0};
@@ -1860,14 +2013,19 @@ void reset_edit_state(void)
 	preview_dirty = 1;
 	app_reset_seq++; /* tells render_single_click_items to reset its statics
 			  */
+	log_info(&logger, "Edit state reset");
 }
 void populate_user_thumbnail(const char *path) { (void)path; }
 
 
+/* GLFW drop callback: handles a file dragged onto the window. Only a single
+   file is supported. Images become the thumbnail; videos are loaded into the
+   player (after resetting edit state and refreshing media info). */
 void drop_callback(GLFWwindow *window, int count, const char **paths)
 {
 	if (count > 1) {
 		error_message = "Multiple file not supported.";
+		log_warn(&logger, "Multiple files dropped (unsupported)");
 		return;
 	}
 	if (!os_isfile(paths[0]) || !os_exists(paths[0])) {
@@ -1876,6 +2034,7 @@ void drop_callback(GLFWwindow *window, int count, const char **paths)
 	switch (check_file_type(paths[0])) {
 	case IMAGE: {
 		populate_user_thumbnail(paths[0]);
+		log_info(&logger, "Thumbnail image dropped: %s", paths[0]);
 		return;
 	}
 	case VIDEO: {
@@ -1892,6 +2051,7 @@ void drop_callback(GLFWwindow *window, int count, const char **paths)
 		vp = vp_create(paths[0], 1);
 		reset_edit_state();
 		refresh_video_info();
+		log_info(&logger, "Loaded video: %s", current_video_path);
 		if (vp) {
 			vp_engine_pause(vp->eng);
 			vp_engine_seek(vp->eng, 0.0,
@@ -1908,6 +2068,7 @@ cleanup:
 }
 
 
+/* Handle keyboard shortcuts: P/Space toggles play/pause, M toggles mute. */
 void handle_shortcut()
 {
 		if (igIsKeyPressed_Bool(ImGuiKey_P, false) || igIsKeyPressed_Bool(ImGuiKey_Space, false)) {
@@ -1922,6 +2083,8 @@ void handle_shortcut()
 		}
 }
 
+/* Application entry point: set up GLFW + OpenGL + ImGui, load fonts, then run
+   the main render loop (poll events, build the UI, draw, swap buffers). */
 int main(int argc, char *argv[])
 {
 	if (!glfwInit())
@@ -2029,6 +2192,7 @@ if (icon[0].pixels)
 
 
 logger_init(&logger,"vpt_log.txt");
+log_info(&logger, "App started");
 const float ui_font_size   = 16.0f;
 const float icon_font_size = ui_font_size * 0.75f;  /* relative; tune 0.7–0.8 */
 

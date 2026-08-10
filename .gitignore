@@ -1,0 +1,15 @@
+# Build artifacts
+/nob
+/build/
+/bin/
+
+# Runtime logs
+/vpt_log.txt
+/log/*.txt
+!log/.gitkeep
+
+# ImGui runtime layout file
+/imgui.ini
+
+# Editor
+.vscode/
